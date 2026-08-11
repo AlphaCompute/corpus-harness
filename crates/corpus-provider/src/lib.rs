@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
@@ -29,6 +29,63 @@ const CONNECT: Duration = Duration::from_secs(15);
 
 const ATTEMPTS: u32 = 3;
 const BACKOFF: Duration = Duration::from_millis(200);
+
+/// RFC 3339 down to the millisecond, which is the grain these questions are asked at.
+///
+/// ponytail: written in UTC, because `now_local` is the call that fails in a process with
+/// threads, and this one has plenty. Whoever reads the line converts.
+pub fn now() -> String {
+    let at = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.millisecond(),
+    )
+}
+
+/// A log line that opens with the moment it was written. Spliced onto the front rather
+/// than built through a map, which would sort the keys and bury the interesting one.
+pub fn stamped<T: Serialize>(value: &T) -> String {
+    let body = serde_json::to_string(value).unwrap_or_default();
+    match body.strip_prefix('{').filter(|rest| *rest != "}") {
+        Some(rest) => format!("{{\"at\":\"{}\",{rest}", now()),
+        None => format!("{{\"at\":\"{}\"}}", now()),
+    }
+}
+
+/// What the inference server actually sent, before anything here has read it. The session
+/// log holds this crate's interpretation of the stream — control tokens stripped, thinking
+/// split from answer, text held back and re-filed — which is the wrong evidence to take to
+/// whoever runs the server. This is the wire itself, and it is the file to attach to a
+/// bug report.
+pub struct Trace(std::sync::Mutex<std::fs::File>);
+
+impl Trace {
+    pub fn to(path: &std::path::Path) -> Result<Trace> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("cannot write the wire trace at {}", path.display()))?;
+        Ok(Trace(std::sync::Mutex::new(file)))
+    }
+
+    /// Never fails the request it is recording: a trace that cannot be written is worth
+    /// less than the turn it would have interrupted.
+    fn record(&self, entry: Value) {
+        if let Ok(mut file) = self.0.lock() {
+            let _ = writeln!(file, "{}", stamped(&entry));
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +216,7 @@ pub struct Provider {
     base_url: String,
     api_key: String,
     pub model: String,
+    trace: Option<Trace>,
 }
 
 impl Provider {
@@ -176,7 +234,14 @@ impl Provider {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             model: model.into(),
+            trace: None,
         }
+    }
+
+    /// Records the wire to this file for as long as the provider lives.
+    pub fn tracing_to(mut self, path: &std::path::Path) -> Result<Provider> {
+        self.trace = Some(Trace::to(path)?);
+        Ok(self)
     }
 
     /// What this provider offers, in the order it lists them.
@@ -236,9 +301,21 @@ impl Provider {
         body: &Value,
         on_delta: &mut (dyn FnMut(Delta<'_>) + Send),
     ) -> Result<Completion, Failure> {
-        let response = self
+        let url = format!("{}/chat/completions", self.base_url);
+        if let Some(trace) = &self.trace {
+            // The body itself stays out: it carries the whole conversation. What a report
+            // needs from this side is which model was asked, and how big the ask was.
+            trace.record(json!({ "post": {
+                "url": url,
+                "model": self.model,
+                "bytes": body.to_string().len(),
+                "messages": body["messages"].as_array().map_or(0, Vec::len),
+                "tools": body["tools"].as_array().map_or(0, Vec::len),
+            }}));
+        }
+        let mut response = self
             .http
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(&url)
             .bearer_auth(&self.api_key)
             .json(body)
             .send()
@@ -246,6 +323,10 @@ impl Provider {
             .map_err(Failure::transport)?;
 
         let status = response.status();
+        if let Some(trace) = &self.trace {
+            // Stamped where the headers land, so the wait before it is the model's own.
+            trace.record(json!({ "status": status.as_u16() }));
+        }
         if !status.is_success() {
             let detail = response.text().await.unwrap_or_default();
             return Err(Failure {
@@ -256,15 +337,22 @@ impl Provider {
 
         let mut acc = Acc::default();
         let mut line = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(Failure::transport)?;
+        let mut read = 0;
+        while let Some(chunk) = response.chunk().await.map_err(Failure::transport)? {
+            read += 1;
             // A line at a time, not a byte at a time: an event arrives split across chunks
             // as often as not, so what crosses a boundary is kept and completed.
             let mut rest: &[u8] = chunk.as_ref();
             while let Some(at) = rest.iter().position(|byte| *byte == b'\n') {
                 line.extend_from_slice(&rest[..at]);
                 rest = &rest[at + 1..];
+                // Which read a line came off is what tells a buffered server from a
+                // streaming one: equal timestamps could be luck, one read cannot.
+                if let Some(trace) = &self.trace
+                    && !line.is_empty()
+                {
+                    trace.record(json!({ "read": read, "line": String::from_utf8_lossy(&line) }));
+                }
                 if acc.feed(&line, on_delta) {
                     acc.flush(on_delta);
                     return Ok(acc.finish());
@@ -272,6 +360,12 @@ impl Provider {
                 line.clear();
             }
             line.extend_from_slice(rest);
+        }
+        // Whatever the stream ended on without a newline of its own.
+        if let Some(trace) = &self.trace
+            && !line.is_empty()
+        {
+            trace.record(json!({ "read": read, "line": String::from_utf8_lossy(&line) }));
         }
         acc.feed(&line, on_delta);
         acc.flush(on_delta);

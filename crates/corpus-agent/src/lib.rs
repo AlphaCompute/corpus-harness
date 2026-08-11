@@ -103,7 +103,10 @@ pub struct Budget {
 impl Default for Budget {
     fn default() -> Budget {
         Budget {
-            max_steps: 30,
+            // A backstop against a loop spinning fast, not a budget for the work: at any
+            // pace a real task keeps, the wall clock below is what stops it first. Set low
+            // enough to bind, it cuts research off mid-stride and reads as a failure.
+            max_steps: 200,
             wall_clock: Duration::from_secs(900),
             cell_timeout: Duration::from_secs(120),
             context_chars: 120_000,

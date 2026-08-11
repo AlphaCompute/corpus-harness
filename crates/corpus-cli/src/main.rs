@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use corpus_agent::{Agent, Budget, Event};
 use corpus_kernel::Kernel;
-use corpus_provider::Provider;
+use corpus_provider::{Provider, stamped};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::host::Tools;
@@ -96,6 +96,8 @@ struct Config {
     model: Option<String>,
     python: Option<String>,
     kernel_dir: PathBuf,
+    /// Where to record the wire, when something needs reporting to whoever runs the model.
+    trace: Option<PathBuf>,
 }
 
 /// Reads `.env` from the working directory. Runs before anything is spawned, which is
@@ -139,6 +141,10 @@ impl Config {
             kernel_dir: std::env::var("CORPUS_KERNEL_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel")),
+            trace: std::env::var("CORPUS_TRACE")
+                .ok()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
         }
     }
 }
@@ -223,6 +229,9 @@ pub struct Sink {
     log: Option<std::fs::File>,
     /// Set while a cell is being written, so its code is opened off the line above it.
     writing: bool,
+    /// Set once the turn has streamed any answer text, so the one the loop writes for
+    /// itself when it gives up is printed rather than duplicating what already appeared.
+    answered: bool,
 }
 
 impl Sink {
@@ -248,6 +257,7 @@ impl Sink {
             render,
             log,
             writing: false,
+            answered: false,
         })
     }
 
@@ -259,7 +269,7 @@ impl Sink {
         }
 
         if let Some(log) = &mut self.log {
-            let _ = writeln!(log, "{}", serde_json::to_string(&event).unwrap_or_default());
+            let _ = writeln!(log, "{}", stamped(&event));
         }
         match self.render {
             Render::Protocol => {
@@ -272,40 +282,47 @@ impl Sink {
         event
     }
 
+    /// Plain text, because this path is taken for a one-shot answer and for a pipe alike,
+    /// and something reading the output has no use for escape codes. The TUI is where
+    /// colour belongs; the log is the machine-readable copy.
     fn draw(&mut self, event: &Event) {
-        let mut out = std::io::stdout();
         match event {
             Event::SessionStart { model, .. } => println!("corpus · {model}"),
-            Event::UserMessage { text, .. } => println!("\n\x1b[1m› {text}\x1b[0m"),
-            Event::ThinkingDelta { text, .. } => print!("\x1b[2m{text}\x1b[0m"),
-            Event::MessageDelta { text, .. } => print!("{text}"),
+            Event::UserMessage { text, .. } => {
+                self.answered = false;
+                println!("\n› {text}");
+            }
+            Event::MessageDelta { text, .. } => {
+                self.answered = true;
+                print!("{text}");
+            }
+            // The loop gave up and said why; nothing streamed it, so nothing else will.
+            Event::Answer { text, .. } if !self.answered && !text.is_empty() => {
+                println!("\n{text}")
+            }
             Event::CodeDelta { text, .. } => {
                 if !self.writing {
                     self.writing = true;
                     println!();
                 }
-                print!("\x1b[2m{text}\x1b[0m");
+                print!("{text}");
             }
             // The line that closes the cell as written and opens what it sent back.
             Event::ToolStart { name, .. } => {
                 self.writing = false;
-                println!("\n\x1b[36m· {name}\x1b[0m");
+                println!("\n· {name}");
             }
-            Event::ToolStream { text, .. } => print!("\x1b[2m{text}\x1b[0m"),
+            Event::ToolStream { text, .. } => print!("{text}"),
             Event::ToolEnd { ok, summary, .. } => {
-                let mark = if *ok { "\x1b[32m✓" } else { "\x1b[31m✗" };
-                println!("{mark} {summary}\x1b[0m");
+                println!("{} {summary}", if *ok { "✓" } else { "✗" })
             }
-            Event::Compaction { dropped, .. } => {
-                println!("\x1b[2m· compacted {dropped} tool results\x1b[0m")
+            Event::Compaction { dropped, .. } => println!("· compacted {dropped} tool results"),
+            Event::TurnEnd { stop, usage, .. } => {
+                println!("\n· {stop:?} · {} in / {} out", usage.input, usage.output)
             }
-            Event::TurnEnd { stop, usage, .. } => println!(
-                "\n\x1b[2m· {stop:?} · {} in / {} out\x1b[0m",
-                usage.input, usage.output
-            ),
             _ => {}
         }
-        let _ = out.flush();
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -320,6 +337,10 @@ async fn build_local(resume: Option<&Path>) -> Result<LocalSession> {
         &config.api_key,
         config.model.unwrap_or_default(),
     );
+    if let Some(path) = &config.trace {
+        eprintln!("wire trace: {}", path.display());
+        provider = provider.tracing_to(path)?;
+    }
     if provider.model.is_empty() {
         provider.model = provider
             .models()

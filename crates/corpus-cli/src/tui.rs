@@ -239,13 +239,7 @@ impl Transcript {
                         .chars()
                         .count()
                         .saturating_sub(total - room + 1);
-                    span.content = span
-                        .content
-                        .chars()
-                        .take(keep)
-                        .chain("…".chars())
-                        .collect::<String>()
-                        .into();
+                    span.content = ellipsize(&span.content, keep).into();
                 }
                 self.wrapped.push(line);
             } else {
@@ -374,11 +368,18 @@ impl App {
                 self.answer_at.get_or_insert(self.transcript.entries.len());
                 self.transcript.stream(2, Style::new(), &text);
             }
-            Event::Answer { text, .. } => {
-                if let Some(at) = self.answer_at.take() {
+            Event::Answer { text, .. } => match self.answer_at.take() {
+                Some(at) => self.transcript.replace_from(at, 2, Style::new(), &text),
+                // An answer nobody streamed is the loop giving up and saying why, which
+                // is the moment it is most worth reading. Without this the turn just
+                // stops after a cell, and a ceiling reads as a hang.
+                None if !text.is_empty() => {
+                    self.transcript.blank();
+                    let at = self.transcript.entries.len();
                     self.transcript.replace_from(at, 2, Style::new(), &text);
                 }
-            }
+                None => {}
+            },
             Event::CodeDelta { text, .. } => {
                 if self.writing_at.is_none() {
                     self.answer_at = None;
@@ -939,6 +940,30 @@ mod tests {
         assert!(
             !screen.contains("print(text"),
             "the body stays folded: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_gives_up_says_so_on_screen() {
+        let agent = Uuid::now_v7();
+        let mut app = App::new();
+        // The shape a ceiling leaves behind: a cell ran, no answer was ever streamed.
+        app.on_event(Event::ToolEnd {
+            agent,
+            call_id: "c1".into(),
+            ok: true,
+            summary: "1 lines".into(),
+            ms: 4,
+        });
+        app.on_event(Event::Answer {
+            agent,
+            text: "Stopped after 200 steps without reaching an answer.".into(),
+        });
+
+        let screen = screen(&mut app, 70, 16);
+        assert!(
+            screen.contains("Stopped after 200 steps"),
+            "why the turn ended must reach the screen, or it reads as a hang: {screen}"
         );
     }
 

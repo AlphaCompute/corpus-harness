@@ -22,10 +22,6 @@ impl Endpoint {
     pub fn requests(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
     }
-
-    pub fn calls(&self) -> usize {
-        self.seen.lock().unwrap().len()
-    }
 }
 
 /// Serves one canned response per request, in order.

@@ -39,14 +39,15 @@ async fn corpus(endpoint: &Endpoint, args: &[&str], env: &[(&str, &str)]) -> Out
     output
 }
 
-/// Identifiers are minted per run, so a transcript is only comparable without them.
+/// Identifiers and timestamps are minted per run, so a transcript is only comparable
+/// without them.
 fn transcript(log: &Path) -> Vec<Value> {
     std::fs::read_to_string(log)
         .unwrap()
         .lines()
         .map(|line| {
             let mut event: Value = serde_json::from_str(line).unwrap();
-            for key in ["session_id", "turn_id", "agent"] {
+            for key in ["session_id", "turn_id", "agent", "at"] {
                 event.as_object_mut().unwrap().remove(key);
             }
             event
@@ -356,7 +357,11 @@ async fn the_step_ceiling_can_be_raised_from_the_environment() {
     )
     .await;
 
-    assert_eq!(endpoint.calls(), 1, "one step means one model call");
+    assert_eq!(
+        endpoint.requests().len(),
+        1,
+        "one step means one model call"
+    );
     let ended = transcript(&log)
         .into_iter()
         .find(|event| event["t"] == "turn_end")

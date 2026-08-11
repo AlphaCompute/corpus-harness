@@ -71,7 +71,7 @@ async fn tool_calls_are_assembled_by_index() {
 }
 
 #[tokio::test]
-async fn a_cell_is_readable_while_it_is_still_being_written() {
+async fn arguments_survive_a_fragment_split_inside_an_escape() {
     let body = sse(&[
         &delta(
             r#""tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"python","arguments":"{\"code\": \"import re"}}]"#,
@@ -103,6 +103,63 @@ async fn a_cell_is_readable_while_it_is_still_being_written() {
     assert_eq!(
         arguments["code"], written,
         "and what was read on screen must be the cell that then runs"
+    );
+}
+
+/// The trace is what gets attached to a report about the server, so it has to hold what
+/// the server said, not what this crate made of it: the control token that never reaches
+/// the answer is still on the wire, and the trace is where it stays visible.
+#[tokio::test]
+async fn the_wire_trace_keeps_what_the_stream_actually_carried() {
+    let body = sse(&[
+        &delta(r#""content":"Done.<|im_end|>""#),
+        &delta(
+            r#""tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"python","arguments":"{\"code\":\"1\"}"}}]"#,
+        ),
+        &finish("tool_calls"),
+    ]);
+    let path = std::env::temp_dir().join(format!("corpus-trace-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let provider = Provider::new(&serve(vec![body]).await.url, "test-key", "test-model")
+        .tracing_to(&path)
+        .unwrap();
+    let completion = provider
+        .stream(&[Message::text(Role::User, "hi")], &[], &mut |_| {})
+        .await
+        .unwrap();
+
+    let trace: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        trace.iter().all(|entry| entry["at"].is_string()),
+        "every line is stamped: {trace:#?}"
+    );
+    assert_eq!(trace[0]["post"]["model"], "test-model");
+    assert_eq!(trace[1]["status"], 200);
+    let wire: String = trace
+        .iter()
+        .filter_map(|entry| entry["line"].as_str())
+        .collect();
+    assert!(
+        wire.contains("<|im_end|>"),
+        "the trace must keep what we strip on the way in: {wire}"
+    );
+    assert!(
+        wire.contains("[DONE]") && wire.contains(r#"\"code\":\"1\""#),
+        "and every raw line that carried the call: {wire}"
+    );
+    assert!(
+        !completion.text.contains("<|im_end|>"),
+        "while the answer itself stays cleaned"
+    );
+    assert!(
+        trace.iter().filter_map(|e| e["read"].as_u64()).count() > 0,
+        "each line says which network read it came off: {trace:#?}"
     );
 }
 

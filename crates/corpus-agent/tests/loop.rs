@@ -52,7 +52,7 @@ async fn an_answer_from_knowledge_costs_one_model_call() {
 
     assert_eq!(outcome.text, "Paris.");
     assert_eq!(outcome.stop, StopReason::Stop);
-    assert_eq!(endpoint.calls(), 1);
+    assert_eq!(endpoint.requests().len(), 1);
     assert!(
         events
             .iter()
@@ -116,7 +116,7 @@ async fn running_out_of_steps_yields_a_partial_answer_not_a_crash() {
         !outcome.text.is_empty(),
         "a partial answer is still an answer"
     );
-    assert_eq!(endpoint.calls(), 2);
+    assert_eq!(endpoint.requests().len(), 2);
     assert!(events.iter().any(|e| matches!(
         e,
         Event::TurnEnd {
@@ -234,7 +234,11 @@ async fn an_interrupt_ends_the_turn_with_whatever_it_has() {
             .iter()
             .any(|e| matches!(e, Event::ToolEnd { ok: false, .. }))
     );
-    assert_eq!(endpoint.calls(), 1, "the loop must not start another step");
+    assert_eq!(
+        endpoint.requests().len(),
+        1,
+        "the loop must not start another step"
+    );
 }
 
 #[tokio::test]
