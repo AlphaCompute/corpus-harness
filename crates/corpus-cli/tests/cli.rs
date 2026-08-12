@@ -266,6 +266,47 @@ async fn with_no_model_named_the_first_one_offered_is_used() {
     assert_eq!(start["model"], "grok-2");
 }
 
+/// The fanout the system prompt sells, over the whole path rather than a piece of it: the
+/// model writes one cell, the cell makes one host call, and a model call per prompt runs
+/// underneath it. The unit test beside `llm_batch` never leaves the host, so nothing there
+/// proves the shim binds the name, that the answers survive the round trip into Python, or
+/// that a cell whose host call outlasts its own timeout is left alone to finish.
+#[tokio::test]
+async fn a_cell_fans_a_batch_out_to_the_model() {
+    let dir = workdir("batch");
+    let log = dir.join("session.jsonl");
+    let code = "answers = llm_batch(prompts=['one', 'two', 'three'])\n\
+                print(len(answers), '|', '|'.join(sorted(answers)))\n";
+    // Every prompt is answered the same, because the batch runs its prompts concurrently
+    // and which one reaches the endpoint first is not something a test may depend on.
+    let endpoint = serve(vec![
+        corpus_testkit::runs_python("call_1", code),
+        says("labelled"),
+        says("labelled"),
+        says("labelled"),
+        says("Three labels."),
+    ])
+    .await;
+
+    corpus(
+        &endpoint,
+        &["Label these.", "--log", log.to_str().unwrap()],
+        &[],
+    )
+    .await;
+
+    let printed = field(&log, "tool_stream", "text").concat();
+    assert!(
+        printed.contains("3 | labelled|labelled|labelled"),
+        "the batch did not come back into the cell: {printed}"
+    );
+    assert_eq!(
+        endpoint.requests().len(),
+        5,
+        "a step, one model call per prompt, and the step that answers"
+    );
+}
+
 /// Documents are only a capability if the packages import inside the kernel as the kernel
 /// actually starts it — cleared environment, its own interpreter, nothing inherited. So the
 /// cell writes both formats and reads them back, and the round-tripped text is the proof.
