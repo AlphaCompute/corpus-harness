@@ -317,6 +317,7 @@ dependencies = [
  "corpus-kernel",
  "corpus-provider",
  "corpus-testkit",
+ "futures-util",
  "ratatui",
  "reqwest",
  "serde",

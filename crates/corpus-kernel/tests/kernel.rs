@@ -14,6 +14,16 @@ impl Host for Echo {
     }
 }
 
+struct Slow(Duration);
+
+#[async_trait]
+impl Host for Slow {
+    async fn call(&self, _: &str, _: Value) -> Result<Value, String> {
+        tokio::time::sleep(self.0).await;
+        Ok(json!("served"))
+    }
+}
+
 async fn start() -> Kernel {
     Kernel::start("python3", &kernel_dir(), &["fetch_url"])
         .await
@@ -45,6 +55,30 @@ async fn namespace_outlives_the_cell() {
     assert!(first.ok, "{}", first.traceback);
     let (second, _) = run(&mut kernel, "x + 1").await;
     assert_eq!(second.repr, "2");
+}
+
+#[tokio::test]
+async fn the_last_value_waits_in_underscore_for_the_next_cell() {
+    let mut kernel = start().await;
+    let (first, _) = run(&mut kernel, "'kept'").await;
+    assert_eq!(first.repr, "'kept'");
+    let (second, _) = run(&mut kernel, "_ + ' and used'").await;
+    assert_eq!(second.repr, "'kept and used'");
+}
+
+#[tokio::test]
+async fn a_value_too_big_to_repr_says_where_the_whole_of_it_is() {
+    let mut kernel = start().await;
+    let (outcome, _) = run(&mut kernel, "'x' * 100_000").await;
+    assert!(outcome.ok, "{}", outcome.traceback);
+    assert!(
+        outcome.repr.contains("the full value is in `_`"),
+        "a truncated repr must point somewhere: {}",
+        outcome.repr
+    );
+
+    let (after, _) = run(&mut kernel, "len(_)").await;
+    assert_eq!(after.repr, "100000", "the pointer has to be true");
 }
 
 #[tokio::test]
@@ -89,6 +123,56 @@ async fn host_error_reaches_the_cell() {
         .unwrap();
     assert!(outcome.ok, "{}", outcome.traceback);
     assert_eq!(out, "caught blocked by allowlist\n");
+}
+
+/// Three calls no one of which is slow, and a host that takes its time over each: their
+/// sum passes the cell timeout long before the cell has run any Python worth killing.
+/// Sharing one clock, the cell dies the moment the last answer lands — after the work
+/// was already done and paid for.
+#[tokio::test]
+async fn waiting_on_the_host_does_not_spend_the_cells_own_clock() {
+    let mut kernel = start().await;
+    let mut out = String::new();
+    let outcome = kernel
+        .exec(
+            "for attempt in range(3):\n    fetch_url(url='slow')\nprint('survived')",
+            &Slow(Duration::from_millis(400)),
+            &mut |text| out.push_str(text),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("the kernel must outlive a patient host");
+    assert!(outcome.ok, "{}", outcome.traceback);
+    assert_eq!(out, "survived\n");
+}
+
+/// A thread the last cell left running keeps calling the host, and is still answered —
+/// but a cell that has wedged must not be kept alive by it, or the timeout is worth
+/// nothing to anyone who is not sitting at the keyboard.
+#[tokio::test]
+async fn a_thread_left_behind_cannot_hold_the_next_cells_clock_open() {
+    let mut kernel = start().await;
+    let (planted, _) = run(
+        &mut kernel,
+        "import threading, time\n\
+         def keep_asking():\n\
+        \x20   while True:\n\
+        \x20       fetch_url(url='background')\n\
+        \x20       time.sleep(0.05)\n\
+         threading.Thread(target=keep_asking, daemon=True).start()",
+    )
+    .await;
+    assert!(planted.ok, "{}", planted.traceback);
+
+    let (wedged, _) = run_within(&mut kernel, "while True: pass", Duration::from_millis(500))
+        .await
+        .unwrap();
+    assert!(!wedged.ok, "a wedged cell outlived its budget");
+    assert!(
+        wedged.traceback.contains("KeyboardInterrupt"),
+        "{}",
+        wedged.traceback
+    );
 }
 
 #[tokio::test]

@@ -3,14 +3,69 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use corpus_kernel::Host;
+use corpus_provider::{Delta, Message, Provider, Role};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 const PAGE_LIMIT: usize = 200_000;
 
-pub struct Tools;
+/// How long a whole batch gets, however many prompts are in it. Two hundred prompts run
+/// as twenty-five waves of the fanout below, so this is the room those waves have before
+/// the tail comes back as errors rather than answers. It is also how long a Ctrl-C landing
+/// mid-batch takes to free the cell, which is what keeps it minutes rather than an hour.
+const BATCH_BUDGET: Duration = Duration::from_secs(300);
+
+/// Eight at a time, so two hundred prompts are twenty-five waves rather than two hundred
+/// round trips, and few enough that a batch does not read as an attack on the provider.
+const BATCH_FANOUT: usize = 8;
+
+pub struct Tools {
+    /// `llm_batch` speaks to the same endpoint as the turn that asked for it, on a
+    /// provider of its own: the agent takes its provider whole, and nothing here may
+    /// borrow it.
+    llm: Provider,
+}
 
 impl Tools {
-    pub const NAMES: &'static [&'static str] = &["fetch_url"];
+    pub const NAMES: &'static [&'static str] = &["fetch_url", "llm_batch"];
+
+    pub fn new(llm: Provider) -> Tools {
+        Tools { llm }
+    }
+
+    /// One model call per prompt, all of them inside one host call: labelling two hundred
+    /// chunks costs a round trip instead of two hundred turns, with no loop and no tool
+    /// schema in between. Element i answers prompt i, and an element that failed says so
+    /// in its own place — three bad answers out of two hundred are three strings to look
+    /// at, not a lost batch. The text is handed back raw, unlike a fetched page: it lands
+    /// in a Python list where a fence would be one more thing the model's code has to
+    /// strip off before `json.loads` will look at it.
+    async fn llm_batch(&self, args: &Value) -> Result<Value, String> {
+        const SHAPE: &str = "llm_batch(prompts=[...]) needs a list of strings";
+        let prompts = args["prompts"]
+            .as_array()
+            .ok_or(SHAPE)?
+            .iter()
+            .map(|prompt| prompt.as_str().map(str::to_string).ok_or(SHAPE))
+            .collect::<Result<Vec<String>, &str>>()?;
+
+        let deadline = tokio::time::Instant::now() + BATCH_BUDGET;
+        let answers: Vec<String> = futures_util::stream::iter(prompts)
+            .map(|prompt| async move {
+                let asked = [Message::text(Role::User, prompt)];
+                let quiet = &mut |_: Delta<'_>| {};
+                match tokio::time::timeout_at(deadline, self.llm.stream(&asked, &[], quiet)).await {
+                    Ok(Ok(answer)) => answer.text,
+                    Ok(Err(failure)) => format!("ERROR: {failure:#}"),
+                    Err(_) => "ERROR: the batch ran out of time before this prompt".into(),
+                }
+            })
+            // Ordered, so the alignment the caller counts on costs nothing to keep.
+            .buffered(BATCH_FANOUT)
+            .collect()
+            .await;
+        Ok(json!(answers))
+    }
 
     async fn fetch_url(&self, args: &Value) -> Result<Value, String> {
         let url = args["url"]
@@ -109,6 +164,7 @@ impl Host for Tools {
     async fn call(&self, name: &str, args: Value) -> Result<Value, String> {
         match name {
             "fetch_url" => self.fetch_url(&args).await,
+            "llm_batch" => self.llm_batch(&args).await,
             other => Err(format!("no host function named `{other}`")),
         }
     }
@@ -157,6 +213,60 @@ fn looks_like_a_secret(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corpus_testkit::{refused, says, serve};
+
+    fn batching(url: &str) -> Tools {
+        Tools::new(Provider::new(url, "test-key", "test-model"))
+    }
+
+    /// The first prompt is refused with something worth retrying, so its answer arrives
+    /// after every other one: the batch finishes in an order the prompts were not written
+    /// in, which is the only arrangement in which alignment is worth asserting. The third
+    /// is refused with something that is not, and comes back as its own error while its
+    /// neighbours keep their answers.
+    #[tokio::test]
+    async fn a_batch_comes_back_aligned_and_a_failure_is_one_element() {
+        let endpoint = serve(vec![
+            refused("500 Internal Server Error", r#"{"error":"busy"}"#),
+            says("b"),
+            refused("400 Bad Request", r#"{"error":"malformed"}"#),
+            says("d"),
+            says("a"),
+        ])
+        .await;
+        let batch = batching(&endpoint.url)
+            .call(
+                "llm_batch",
+                json!({ "prompts": ["one", "two", "three", "four"] }),
+            )
+            .await
+            .expect("a batch is data, never an error");
+        let answers: Vec<&str> = batch
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|answer| answer.as_str().unwrap())
+            .collect();
+
+        assert_eq!(answers[0], "a", "the retried prompt kept its place");
+        assert_eq!(answers[1], "b");
+        assert!(
+            answers[2].starts_with("ERROR:"),
+            "a refusal must be an element, not an exception: {}",
+            answers[2]
+        );
+        assert_eq!(answers[3], "d");
+        assert_eq!(answers.len(), 4, "one element per prompt");
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_the_wrong_shape_is_refused_in_words() {
+        let refusal = batching("http://127.0.0.1:1")
+            .call("llm_batch", json!({ "prompts": "one" }))
+            .await
+            .expect_err("a bare string is not a batch");
+        assert!(refusal.contains("needs a list of strings"), "{refusal}");
+    }
 
     #[test]
     fn secrets_go_and_prose_stays() {

@@ -14,7 +14,12 @@ MAX_REPR = 4000
 # The protocol must survive `print` inside a cell forging a frame, so it moves off fd 1
 # before anything else runs: fd 1 becomes stderr (subprocesses can only pollute the log),
 # sys.stdout becomes a proxy that emits `stream` frames.
-_proto = os.fdopen(os.dup(1), "w", buffering=1, encoding="utf-8", newline="\n")
+# Text a cell chunked out of a mixed-encoding file can hold a lone surrogate, which no
+# encoder will take: it is replaced rather than raised, because the frame is the only way
+# the cell has of saying anything at all, including that something went wrong.
+_proto = os.fdopen(
+    os.dup(1), "w", buffering=1, encoding="utf-8", errors="replace", newline="\n"
+)
 os.dup2(2, 1)
 
 _proto_lock = threading.Lock()
@@ -59,9 +64,13 @@ def _host_fn(name):
 
     def call(**kwargs):
         # The shim mints no identifiers of its own (§4.1): req_id is derived from the
-        # cell id the host assigned, so it stays unique without a uuid dependency.
+        # cell id the host assigned, so it stays unique without a uuid dependency. The
+        # cell is what the main thread is running, and only calls from there are named
+        # after it: a thread the cell spawned outlives the cell that spawned it, and its
+        # calls must not pass for the cell's own progress.
         counter[0] += 1
-        req_id = f"{_current_id}#{name}{counter[0]}"
+        cell = _current_id if threading.current_thread() is threading.main_thread() else ""
+        req_id = f"{cell}#{name}{counter[0]}"
         event = threading.Event()
         with _pending_lock:
             _pending[req_id] = [event, None]
@@ -113,7 +122,11 @@ def _safe_repr(value):
         text = repr(value)
     except BaseException as exc:
         text = f"<unrepresentable: {exc!r}>"
-    return text if len(text) <= MAX_REPR else text[:MAX_REPR] + "... [truncated]"
+    if len(text) <= MAX_REPR:
+        return text
+    # Only ever the tail value, which `_run` has just bound to `_`, so the pointer is honest:
+    # the reader can go and slice the thing instead of mourning it.
+    return f"{text[:MAX_REPR]}... [truncated; the full value is in `_` (repr: {len(text)} chars)]"
 
 
 def _run(cell_id, code, ns):
@@ -127,6 +140,10 @@ def _run(cell_id, code, ns):
             ast.fix_missing_locations(tail)
         exec(compile(block, "<cell>", "exec"), ns)
         value = eval(compile(tail, "<cell>", "eval"), ns) if tail is not None else None
+        if value is not None:
+            # IPython's bargain, for IPython's reason: a result too big to read is not lost,
+            # it is one name away. None is skipped so a statement cell cannot erase it.
+            ns["_"] = value
         _send(
             type="done",
             id=cell_id,
@@ -143,7 +160,9 @@ def _run(cell_id, code, ns):
 
 def main():
     init = json.loads(sys.stdin.readline())
-    ns = {"__name__": "__corpus__", "HostError": HostError}
+    # `_` is bound from the start, so a peek written before anything returned a value
+    # reads as empty rather than raising over a name the prompt promised.
+    ns = {"__name__": "__corpus__", "HostError": HostError, "_": ""}
     for name in init.get("fns", []):
         ns[name] = _host_fn(name)
 

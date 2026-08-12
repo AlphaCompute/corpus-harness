@@ -184,6 +184,42 @@ async fn compaction_drops_old_tool_output_and_keeps_the_question() {
 }
 
 #[tokio::test]
+async fn a_resumed_transcript_does_not_promise_a_namespace_that_is_gone() {
+    let endpoint = serve(vec![says("It is gone; I will fetch it again.")]).await;
+    let mut agent = agent(&endpoint, Arc::new(Recorder::default()), Budget::default()).await;
+
+    agent.replay([Event::UserMessage {
+        turn_id: uuid::Uuid::nil(),
+        text: "Fetch the page into `page`.".into(),
+    }]);
+    ask(&mut agent, "What was in it?").await;
+
+    let sent = &endpoint.requests()[0];
+    assert!(
+        sent.contains("interpreter is fresh"),
+        "a replayed session must say its variables did not come back: {sent}"
+    );
+}
+
+#[tokio::test]
+async fn a_result_too_big_for_the_context_points_at_the_variable() {
+    let endpoint = serve(vec![
+        runs_python("call_1", "print('x' * 20_000)"),
+        says("Sliced it."),
+    ])
+    .await;
+    let mut agent = agent(&endpoint, Arc::new(Recorder::default()), Budget::default()).await;
+
+    let (outcome, _) = ask(&mut agent, "Make something enormous.").await;
+
+    assert_eq!(outcome.text, "Sliced it.");
+    assert!(
+        endpoint.requests()[1].contains("whole in `_`"),
+        "a cut result must tell the model where the value still is"
+    );
+}
+
+#[tokio::test]
 async fn a_cell_that_never_returns_does_not_hang_the_turn() {
     let endpoint = serve(vec![runs_python("call_1", "while True: pass")]).await;
     let budget = Budget {

@@ -219,6 +219,10 @@ impl Kernel {
             match frame {
                 Frame::Stream { id: cell, text } if cell == id => on_stream(&text),
                 Frame::HostRequest { req_id, func, args } => {
+                    // A thread an abandoned cell left running keeps asking, and its
+                    // requests are still answered — but the cell id the shim derives them
+                    // from is the one that may buy this cell more clock.
+                    let mine = req_id.split('#').next() == Some(id.as_str());
                     let reply = match host.call(&func, args).await {
                         Ok(value) => {
                             json!({ "type": "host_reply", "req_id": req_id, "ok": true, "value": value })
@@ -228,6 +232,14 @@ impl Kernel {
                         }
                     };
                     self.send(&reply)?;
+                    // The clock measures the cell's own work, not the host's: a host call
+                    // carries its own budget, and a cell that spent an hour waiting on
+                    // three fetches was never the runaway this timeout is for. Once the
+                    // interrupt has gone out the grace period stands, or a cell could buy
+                    // itself another lifetime by asking for one more page.
+                    if !interrupted && mine {
+                        deadline = Instant::now() + timeout;
+                    }
                 }
                 Frame::Done {
                     id: cell,

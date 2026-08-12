@@ -9,7 +9,13 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 const TOOL_RESULT_LIMIT: usize = 8000;
-const DROPPED: &str = "[output dropped to save context; run the call again if you still need it]";
+const DROPPED: &str =
+    "[output dropped to save context; whatever the cell bound is still alive in the session]";
+
+/// A replayed transcript is full of promises about `_` and about variables that the log
+/// cannot restore, so the model is told once, up front, that only the dialogue came back.
+const RESUMED: &str = "\n\nThis session was resumed from a log. The interpreter is fresh: \
+    the variables, imports and `_` the transcript talks about no longer exist.";
 
 /// The session log. The model's context is derived from it, never stored beside it,
 /// which is what lets compaction drop tool output without losing the session (§4.1).
@@ -203,8 +209,14 @@ impl Agent {
     }
 
     /// Rebuilds the model's context from the session log. The kernel namespace does not
-    /// come back: variables from the earlier run are gone and the model must refetch.
+    /// come back: variables from the earlier run are gone, which the system message says
+    /// out loud so the transcript's own promises do not mislead the model.
     pub fn replay(&mut self, events: impl IntoIterator<Item = Event>) {
+        if let Some(system) = self.messages.first_mut()
+            && let Some(prompt) = system.content.as_mut()
+        {
+            prompt.push_str(RESUMED);
+        }
         let mut pending: Option<ToolCall> = None;
         let mut output = String::new();
         for event in events {
@@ -472,7 +484,12 @@ fn tool_result(ok: bool, mut result: String, failure: &str) -> String {
     }
     if result.len() > TOOL_RESULT_LIMIT {
         result.truncate(result.floor_char_boundary(TOOL_RESULT_LIMIT));
-        result.push_str("\n[truncated; keep the rest in a variable and process it in code]");
+        // Which half was cut — printed output or the repr — cannot be told apart once they
+        // are one string, so the note claims only what is true of both.
+        result.push_str(
+            "\n[truncated; the value a cell ends on stays whole in `_`, and anything printed is \
+             worth re-deriving by slicing in code]",
+        );
     }
     result
 }

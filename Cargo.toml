@@ -13,6 +13,9 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest ={ version = "0.12", default-features = false, features = ["json", "http2", "charset", "rustls-tls"] }
+# Already in the graph under reqwest. Taken for `buffered` alone: bounded fan-out that
+# hands the results back in the order they were asked for.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt-multi-thread", "time", "net", "io-std"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 # Already in the graph under ratatui, so stamping the log costs nothing new. Its own
