@@ -132,6 +132,61 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
     );
 }
 
+/// Every agent's stream shares the one pipe `connect` reads, so the turn this side is
+/// waiting on has to be named. Taking the first ending that goes past would hand a turn
+/// back while it is still running, and whatever is typed next lands on top of it.
+#[tokio::test]
+async fn a_child_finishing_does_not_end_the_turn_a_client_is_reading() {
+    let dir = workdir("connect-child");
+    let log = dir.join("client.jsonl");
+    let endpoint = serve(vec![
+        runs_python(
+            "call_1",
+            "kid = spawn('go and look')\nwhile kid.result(timeout=10) is None: pass\n",
+        ),
+        says("What the agent found."),
+        says("Both are in."),
+    ])
+    .await;
+
+    let output = tokio::process::Command::new(BIN)
+        .env("CORPUS_BASE_URL", &endpoint.url)
+        .env("CORPUS_API_KEY", "test-key")
+        .env("CORPUS_MODEL", "test-model")
+        .env("CORPUS_KERNEL_DIR", kernel_dir())
+        .args([
+            "connect",
+            "Send one off.",
+            "--log",
+            log.to_str().unwrap(),
+            "--",
+            BIN,
+            "serve",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "connect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = events(&log);
+    // The child's turn and the session's own, and possibly the turn the news then
+    // started over there: what matters is that more than one ending came past.
+    assert!(
+        events.iter().filter(|e| e["t"] == "turn_end").count() >= 2,
+        "every agent's stream shares this pipe, so more than one ending crosses it"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["t"] == "answer" && event["text"] == "Both are in."),
+        "the turn must be read to its own end, not to the first end that goes past"
+    );
+}
+
 /// An answer that cost tokens, so a session can be billed for what its agents spend.
 fn says_costing(text: &str, input: u32, output: u32) -> Vec<u8> {
     corpus_testkit::sse(&[
@@ -243,6 +298,10 @@ async fn an_agent_coming_back_is_a_turn_the_session_takes_on_its_own() {
     assert!(
         told.contains("finished") && told.contains("The numbers are 3, 5 and 8"),
         "the doorbell says who finished and enough to place it: {told}"
+    );
+    assert!(
+        told.contains("UNTRUSTED CONTENT"),
+        "what is quoted in it is an agent's own words, and an agent quotes what it read: {told}"
     );
     assert!(
         told.chars().count() < long.chars().count(),

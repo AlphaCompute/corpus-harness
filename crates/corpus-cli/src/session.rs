@@ -283,7 +283,7 @@ impl Remote {
     async fn pump(
         &mut self,
         on_event: &mut (dyn FnMut(Event) + Send),
-        until: fn(&Event) -> bool,
+        mut until: impl FnMut(&Event) -> bool,
     ) -> Result<()> {
         while let Some(line) = self.lines.next_line().await? {
             if line.trim().is_empty() {
@@ -307,8 +307,21 @@ impl Session for Remote {
         self.send(&Command::Run {
             text: prompt.to_string(),
         })?;
-        self.pump(on_event, |event| matches!(event, Event::TurnEnd { .. }))
-            .await
+        // Every agent over there is on this one pipe, so the end being waited for has to
+        // be named: a child finishing mid-turn would otherwise hand this side a turn that
+        // is not over, and whatever was typed next would go out on top of it. The turn is
+        // named by the first start that comes back, which is the one just asked for — a
+        // child cannot start before the cell that makes it has run.
+        let mut turn = None;
+        self.pump(on_event, |event| match event {
+            Event::TurnStart { turn_id, .. } => {
+                turn.get_or_insert(*turn_id);
+                false
+            }
+            Event::TurnEnd { turn_id, .. } => turn == Some(*turn_id),
+            _ => false,
+        })
+        .await
     }
 
     /// The children live where the loop does, so a turn started by their news is started

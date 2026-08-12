@@ -207,11 +207,24 @@ impl Transcript {
     /// The final answer replaces what was streamed for it: a provider can correct itself
     /// mid-stream, and the log is what the transcript should agree with.
     fn replace_from(&mut self, at: usize, indent: u16, style: Style, text: &str) {
-        self.touch(at);
-        self.entries.truncate(at);
+        let kept = self.lift(at, false);
         if !text.is_empty() {
             self.push_text(indent, style, text);
         }
+        self.entries.extend(kept);
+    }
+
+    /// Drops the entries from `at` and hands back the ready-made lines among them, which
+    /// are not the writer's own text and do not go with it: a child sent off mid-answer or
+    /// mid-cell leaves one, and it has to outlive whatever it landed in the middle of.
+    /// `skip_replaced` drops the first as well, for a caller putting a line in its place.
+    fn lift(&mut self, at: usize, skip_replaced: bool) -> Vec<Entry> {
+        self.touch(at);
+        self.entries
+            .drain(at.min(self.entries.len())..)
+            .skip(usize::from(skip_replaced))
+            .filter(|entry| matches!(entry, Entry::Ready { .. }))
+            .collect()
     }
 
     fn push_ready(&mut self, line: Line<'static>, flex: bool) {
@@ -219,19 +232,10 @@ impl Transcript {
         self.entries.push(Entry::Ready { line, flex });
     }
 
-    /// Drops everything from `at` and puts one ready-made line in its place. `push_ready`
-    /// touches what the truncate left behind, which is this same index.
-    ///
-    /// What a cell printed collapses into the line that replaces it; ready-made lines do
-    /// not, because they are not the cell's output. A child sent off mid-cell leaves one
-    /// of those, and it has to outlive the cell that sent it: otherwise the only word of
-    /// a child that runs for minutes disappears the moment its parent's cell ends.
+    /// Drops everything from `at` and puts one ready-made line in its place. What a cell
+    /// printed collapses into that line; what is lifted out of the way does not.
     fn replace_line(&mut self, at: usize, line: Line<'static>, flex: bool) {
-        let kept: Vec<Entry> = self
-            .entries
-            .drain(at.min(self.entries.len())..)
-            .filter(|entry| matches!(entry, Entry::Ready { .. }))
-            .collect();
+        let kept = self.lift(at, true);
         self.push_ready(line, flex);
         self.entries.extend(kept);
     }
@@ -461,7 +465,6 @@ impl App {
                 self.busy_with("thinking");
             }
             Event::AgentStart { agent, task, .. } => {
-                self.answer_at = None;
                 self.transcript.blank();
                 self.transcript.push_ready(
                     step("·", ACCENT, "agent", one_line(&task), String::new()),
@@ -477,7 +480,6 @@ impl App {
                     true => ("✓", Color::Green),
                     false => ("✗", Color::Red),
                 };
-                self.answer_at = None;
                 self.transcript.push_ready(
                     step(
                         mark,
@@ -1025,6 +1027,11 @@ mod tests {
         assert!(
             screen.contains("✓ python · print('hi') · ↑ 1 ↓ 1 lines · 12ms"),
             "{screen}"
+        );
+        assert_eq!(
+            screen.matches("python · print('hi')").count(),
+            1,
+            "the finished step takes the running one's place rather than following it: {screen}"
         );
         assert!(screen.contains("  Said hi."), "{screen}");
     }
@@ -1803,5 +1810,50 @@ mod tests {
             Action::Nothing
         ));
         assert!(app.input.is_empty());
+    }
+
+    /// A child coming back lands in the middle of whatever the parent is saying, and the
+    /// final answer replaces what was streamed for it. The one must not cost the other:
+    /// the answer is replaced in place, and the child's line is still there afterwards.
+    #[test]
+    fn a_child_landing_mid_answer_costs_the_answer_nothing() {
+        let root = Uuid::now_v7();
+        let child = Uuid::now_v7();
+        let mut app = App::new();
+        for event in [
+            Event::AgentStart {
+                agent: child,
+                parent: root,
+                task: "dig".into(),
+            },
+            Event::MessageDelta {
+                agent: root,
+                text: "Here is the summary.".into(),
+            },
+            Event::AgentEnd {
+                agent: child,
+                parent: root,
+                ok: true,
+                chars: 4,
+                preview: "done".into(),
+            },
+            Event::Answer {
+                agent: root,
+                text: "Here is the summary.".into(),
+            },
+        ] {
+            app.on_event(event);
+        }
+
+        let screen = screen(&mut app, 60, 20);
+        assert_eq!(
+            screen.matches("Here is the summary.").count(),
+            1,
+            "the answer replaces what was streamed for it, wherever a child landed: {screen}"
+        );
+        assert!(
+            screen.contains("✓ agent · dig"),
+            "and the child that landed in it is still on screen: {screen}"
+        );
     }
 }

@@ -293,9 +293,12 @@ pub fn doorbell(news: &[Event]) -> Option<String> {
         .collect();
     match lines.is_empty() {
         true => None,
+        // Fenced, because the openings quoted in here are the agents' own words, and an
+        // agent that read a page is repeating what the page said. This is the one place a
+        // child's text reaches the parent without passing through `result`.
         // Where the rest of an answer is kept is in the prompt, said once for the session
         // rather than again on every child that comes back.
-        false => Some(lines.join("\n")),
+        false => Some(fence("your agents", &lines.join("\n"))),
     }
 }
 
