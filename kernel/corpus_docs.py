@@ -2,19 +2,23 @@
 Greek or anything else comes out as filled boxes unless a real TTF is registered first, and
 nothing in the pipeline complains — the file only looks wrong once someone opens it."""
 
+import html
 import re
 from pathlib import Path
 
 # Whole-Unicode faces first, then the DejaVu that every Linux distribution puts somewhere
 # slightly different.
-CANDIDATES = (
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    "/Library/Fonts/Arial Unicode.ttf",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+CANDIDATES = tuple(
+    Path(path)
+    for path in (
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    )
 )
 
 
@@ -30,7 +34,7 @@ def _bold_for(regular):
     one on a Mac is not — so a bold belonging to another candidate is taken rather than
     leaving emphasis to render as no emphasis at all.
     """
-    for base in (regular, *(Path(path) for path in CANDIDATES)):
+    for base in (regular, *CANDIDATES):
         for suffix in BOLD_SUFFIXES:
             bold = base.with_name(base.stem + suffix + base.suffix)
             if bold.exists():
@@ -52,7 +56,6 @@ def unicode_font(name="Unicode"):
     if name in pdfmetrics.getRegisteredFontNames():
         return name
     for path in CANDIDATES:
-        path = Path(path)
         if not path.exists():
             continue
         pdfmetrics.registerFont(TTFont(name, str(path)))
@@ -61,12 +64,9 @@ def unicode_font(name="Unicode"):
             pdfmetrics.registerFont(TTFont(f"{name}-Bold", str(bold)))
         # Mapped even where there is no bold file: an unmapped family sends `<b>` to
         # Helvetica-Bold, which is Latin-1 and loses the alphabet this was chosen for.
+        weight = f"{name}-Bold" if bold is not None else name
         pdfmetrics.registerFontFamily(
-            name,
-            normal=name,
-            bold=f"{name}-Bold" if bold is not None else name,
-            italic=name,
-            boldItalic=f"{name}-Bold" if bold is not None else name,
+            name, normal=name, bold=weight, italic=name, boldItalic=weight
         )
         return name
     raise LookupError(
@@ -124,18 +124,19 @@ def blocks(text, font=None):
             at += 1
             continue
 
-        heading = _HEADING.match(line)
-        if heading:
+        kind = _kind(line)
+        if kind == "heading":
+            heading = _HEADING.match(line)
             level = min(len(heading.group(1)), 6)
             body = _inline(heading.group(2))
             out.append(Paragraph(f"<b>{body}</b>", styles[f"Heading{level}"]))
             at += 1
-        elif _is_row(line):
-            rows, at = _take(lines, at, _is_row)
+        elif kind == "row":
+            rows, at = _take(lines, at, lambda l: _kind(l) == "row")
             out.append(_table(rows, styles))
-        elif _item(line) is not None:
+        elif kind == "item":
             numbered = _NUMBERED.match(line) is not None
-            raw, at = _take(lines, at, lambda l: _item(l) is not None)
+            raw, at = _take(lines, at, lambda l: _kind(l) == "item")
             items = [
                 ListItem(Paragraph(_inline(_item(line)), styles["BodyText"]))
                 for line in raw
@@ -151,7 +152,7 @@ def blocks(text, font=None):
         else:
             # A paragraph runs until something else starts, and its line breaks are the
             # width of whoever typed it rather than anything the reader should see.
-            raw, at = _take(lines, at, lambda l: l.strip() and not _opens_block(l))
+            raw, at = _take(lines, at, lambda l: l.strip() and _kind(l) is None)
             body = " ".join(piece.strip() for piece in raw)
             out.append(Paragraph(_inline(body), styles["BodyText"]))
     return out
@@ -185,14 +186,19 @@ def _item(line):
     return match.group(1) if match else None
 
 
-def _is_row(line):
-    return line.lstrip().startswith("|")
+def _kind(line):
+    """Which kind of block the line opens, or None when it is prose.
 
-
-def _opens_block(line):
-    return (
-        _HEADING.match(line) is not None or _is_row(line) or _item(line) is not None
-    )
+    Asked twice: once to dispatch, and once by the paragraph that runs until the next
+    block starts. A block type added here is one both of them already know about.
+    """
+    if _HEADING.match(line) is not None:
+        return "heading"
+    if line.lstrip().startswith("|"):
+        return "row"
+    if _item(line) is not None:
+        return "item"
+    return None
 
 
 def _table(rows, styles):
@@ -239,7 +245,7 @@ def _table(rows, styles):
 def _inline(text):
     """Markdown emphasis as the mini-HTML a reportlab paragraph reads. Escaped first,
     because a `<` that came from the text is content and must not become a tag."""
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = html.escape(text, quote=False)
     text = re.sub(r"`([^`]+)`", _code, text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     return re.sub(r"\*([^*\n]+)\*", r"<i>\1</i>", text)

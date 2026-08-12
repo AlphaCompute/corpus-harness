@@ -109,8 +109,7 @@ def _reader():
                 slot = _pending.get(msg.get("req_id"))
                 if slot is not None:
                     slot[1] = msg
-            if slot is not None:
-                slot[0].set()
+                    slot[0].set()
     os._exit(0)
 
 
