@@ -101,33 +101,49 @@ fn thinking() -> Style {
 
 /// A logical line of the transcript. Wrapping happens at draw time against the current
 /// width, so a resize reflows the whole history instead of leaving ragged old lines.
-struct Entry {
-    indent: u16,
-    style: Style,
-    text: String,
-    /// Still being streamed into: the next delta of the same kind extends it.
-    open: bool,
-    /// Already styled span by span, so it is placed rather than wrapped.
-    ready: Option<Line<'static>>,
+enum Entry {
+    Text {
+        indent: u16,
+        style: Style,
+        text: String,
+        /// Still being streamed into: the next delta of the same kind extends it.
+        open: bool,
+    },
+    /// Already styled span by span, so it is placed rather than wrapped. `flex` names the
+    /// span that gives way when the terminal is too narrow, and belongs to whoever built
+    /// the line: a lockup has no span it is willing to lose.
+    Ready {
+        line: Line<'static>,
+        flex: Option<usize>,
+    },
 }
 
 #[derive(Default)]
 struct Transcript {
     entries: Vec<Entry>,
     wrapped: Vec<Line<'static>>,
+    /// Where each entry's wrapped lines begin in `wrapped`. Streaming only ever touches
+    /// the end of the transcript, so this is what lets a redraw lay out the last entry
+    /// again instead of the whole history.
+    starts: Vec<usize>,
     /// What `wrapped` was last laid out from, so a redraw that changed neither the text
     /// nor the width can keep it.
     at_width: u16,
-    dirty: bool,
+    /// The earliest entry whose layout is no longer good.
+    dirty: Option<usize>,
 }
 
 impl Transcript {
+    fn touch(&mut self, at: usize) {
+        self.dirty = Some(self.dirty.map_or(at, |first| first.min(at)));
+    }
+
     /// A separator, unless the transcript already ends in one.
     fn blank(&mut self) {
         if self
             .entries
             .last()
-            .is_some_and(|entry| entry.text.is_empty() && entry.ready.is_none())
+            .is_some_and(|entry| matches!(entry, Entry::Text { text, .. } if text.is_empty()))
         {
             self.close();
             return;
@@ -135,136 +151,144 @@ impl Transcript {
         self.line(0, Style::new(), "");
     }
 
+    /// One entry per newline, because nothing downstream breaks a line for us: `wrap`
+    /// splits on width alone, and a `\n` left inside an entry reaches the screen as a
+    /// control character.
+    fn push_text(&mut self, indent: u16, style: Style, text: &str) {
+        self.touch(self.entries.len());
+        for piece in text.split('\n') {
+            self.entries.push(Entry::Text {
+                indent,
+                style,
+                text: piece.to_string(),
+                open: false,
+            });
+        }
+    }
+
     fn line(&mut self, indent: u16, style: Style, text: impl Into<String>) {
         self.close();
-        self.dirty = true;
-        self.entries.push(Entry {
-            indent,
-            style,
-            text: text.into(),
-            open: false,
-            ready: None,
-        });
+        self.push_text(indent, style, &text.into());
     }
 
     fn stream(&mut self, indent: u16, style: Style, text: &str) {
-        self.dirty = true;
+        // The last entry is either extended, replaced or followed; nothing before it moves.
+        self.touch(self.entries.len().saturating_sub(1));
         for (n, piece) in text.split('\n').enumerate() {
             let extend = n == 0
-                && matches!(self.entries.last(), Some(e) if e.open && e.indent == indent && e.style == style);
+                && matches!(self.entries.last(), Some(Entry::Text { open: true, indent: at, style: with, .. }) if *at == indent && *with == style);
             if !extend {
                 // The placeholder left by a trailing newline was waiting for more of the
                 // same kind; text of another kind means it never arrived. Text of the
                 // same kind means the writer meant a blank line, and it stays.
-                let stale = self.entries.last().is_some_and(|e| {
-                    e.open && e.text.is_empty() && (e.indent != indent || e.style != style)
+                let stale = self.entries.last().is_some_and(|entry| {
+                    matches!(entry, Entry::Text { open: true, text, indent: at, style: with }
+                        if text.is_empty() && (*at != indent || *with != style))
                 });
                 if stale {
                     self.entries.pop();
                 }
-                self.entries.push(Entry {
+                self.entries.push(Entry::Text {
                     indent,
                     style,
                     text: String::new(),
                     open: true,
-                    ready: None,
                 });
             }
-            self.entries
-                .last_mut()
-                .expect("just pushed")
-                .text
-                .push_str(piece);
+            let Some(Entry::Text { text, .. }) = self.entries.last_mut() else {
+                unreachable!("just pushed");
+            };
+            text.push_str(piece);
         }
     }
 
     /// The final answer replaces what was streamed for it: a provider can correct itself
     /// mid-stream, and the log is what the transcript should agree with.
     fn replace_from(&mut self, at: usize, indent: u16, style: Style, text: &str) {
-        self.dirty = true;
+        self.touch(at);
         self.entries.truncate(at);
         if !text.is_empty() {
-            for piece in text.split('\n') {
-                self.entries.push(Entry {
-                    indent,
-                    style,
-                    text: piece.to_string(),
-                    open: false,
-                    ready: None,
-                });
-            }
+            self.push_text(indent, style, text);
         }
     }
 
-    fn push_ready(&mut self, line: Line<'static>) {
-        self.dirty = true;
-        self.entries.push(Entry {
-            indent: 0,
-            style: Style::new(),
-            text: String::new(),
-            open: false,
-            ready: Some(line),
-        });
+    fn push_ready(&mut self, line: Line<'static>, flex: Option<usize>) {
+        self.touch(self.entries.len());
+        self.entries.push(Entry::Ready { line, flex });
     }
 
     /// Drops everything from `at` and puts one ready-made line in its place.
-    fn replace_line(&mut self, at: usize, line: Line<'static>) {
+    fn replace_line(&mut self, at: usize, line: Line<'static>, flex: Option<usize>) {
+        self.touch(at);
         self.entries.truncate(at);
-        self.push_ready(line);
+        self.push_ready(line, flex);
     }
 
     fn close(&mut self) {
-        let Some(entry) = self.entries.last_mut() else {
+        let Some(Entry::Text { open, text, .. }) = self.entries.last_mut() else {
             return;
         };
-        self.dirty = true;
         // A block that ended with a newline left an empty line waiting for text that
         // never came; it would read as a gap nobody asked for.
-        if entry.open && entry.text.is_empty() {
+        if *open && text.is_empty() {
             self.entries.pop();
+            self.touch(self.entries.len());
         } else {
-            entry.open = false;
+            *open = false;
         }
     }
 
     fn rewrap(&mut self, width: u16) {
         // Redrawn far more often than it changes: a pulse tick, a keystroke or a scroll
-        // leaves every wrapped line exactly where it was.
-        if !self.dirty && self.at_width == width {
-            return;
-        }
-        self.dirty = false;
+        // leaves every wrapped line exactly where it was. A change part-way through costs
+        // only the entries from there on, so a token arriving into a long session does not
+        // lay the whole history out again.
+        let from = match self.dirty {
+            _ if self.at_width != width => 0,
+            Some(first) => first.min(self.entries.len()).min(self.starts.len()),
+            None => return,
+        };
+        self.dirty = None;
         self.at_width = width;
-        self.wrapped.clear();
-        for entry in &self.entries {
-            if let Some(ready) = &entry.ready {
-                let mut line = ready.clone();
-                let room = width as usize;
-                let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-                if total > room
-                    && let Some(span) = line.spans.get_mut(FLEX_SPAN)
-                {
-                    let keep = span
-                        .content
-                        .chars()
-                        .count()
-                        .saturating_sub(total - room + 1);
-                    span.content = ellipsize(&span.content, keep).into();
-                }
-                self.wrapped.push(line);
-            } else {
-                let room = (width as usize)
-                    .saturating_sub(entry.indent as usize)
-                    .max(8);
-                for piece in wrap(&entry.text, room) {
-                    let mut text = " ".repeat(entry.indent as usize);
-                    text.push_str(&piece);
-                    if entry.style.bg.is_some() {
-                        // A band has to reach both edges, or it reads as a highlighted word.
-                        let pad = (width as usize).saturating_sub(text.chars().count());
-                        text.push_str(&" ".repeat(pad));
+        let cut = self.starts.get(from).copied().unwrap_or(self.wrapped.len());
+        self.wrapped.truncate(cut);
+        self.starts.truncate(from);
+        for entry in &self.entries[from..] {
+            self.starts.push(self.wrapped.len());
+            match entry {
+                Entry::Ready { line, flex } => {
+                    let mut line = line.clone();
+                    let room = width as usize;
+                    let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+                    if total > room
+                        && let Some(span) = flex.and_then(|at| line.spans.get_mut(at))
+                    {
+                        let keep = span
+                            .content
+                            .chars()
+                            .count()
+                            .saturating_sub(total - room + 1);
+                        span.content = ellipsize(&span.content, keep).into();
                     }
-                    self.wrapped.push(Line::styled(text, entry.style));
+                    self.wrapped.push(line);
+                }
+                Entry::Text {
+                    indent,
+                    style,
+                    text,
+                    ..
+                } => {
+                    let room = (width as usize).saturating_sub(*indent as usize).max(8);
+                    for piece in wrap(text, room) {
+                        let mut line = " ".repeat(*indent as usize);
+                        line.push_str(&piece);
+                        if style.bg.is_some() {
+                            // A band has to reach both edges, or it reads as a highlighted word.
+                            let pad = (width as usize).saturating_sub(line.chars().count());
+                            line.push_str(&" ".repeat(pad));
+                        }
+                        self.wrapped.push(Line::styled(line, *style));
+                    }
                 }
             }
         }
@@ -365,16 +389,22 @@ impl App {
             tool: None,
         };
         let brand = Style::new().fg(BRAND);
-        app.transcript.push_ready(Line::styled(MARK[0], brand));
-        app.transcript.push_ready(Line::from(vec![
-            Span::styled(MARK[1], brand),
-            Span::raw(format!("  corpus v{}", env!("CARGO_PKG_VERSION"))),
-        ]));
-        app.transcript.push_ready(Line::from(vec![
-            Span::styled(MARK[2], brand),
-            Span::raw("  by "),
-            Span::styled(WORDMARK, Style::new().add_modifier(Modifier::BOLD)),
-        ]));
+        app.transcript.push_ready(Line::styled(MARK[0], brand), None);
+        app.transcript.push_ready(
+            Line::from(vec![
+                Span::styled(MARK[1], brand),
+                Span::raw(format!("  corpus v{}", env!("CARGO_PKG_VERSION"))),
+            ]),
+            None,
+        );
+        app.transcript.push_ready(
+            Line::from(vec![
+                Span::styled(MARK[2], brand),
+                Span::raw("  by "),
+                Span::styled(WORDMARK, Style::new().add_modifier(Modifier::BOLD)),
+            ]),
+            None,
+        );
         app
     }
 
@@ -406,8 +436,7 @@ impl App {
                 // stops after a cell, and a ceiling reads as a hang.
                 None if !text.is_empty() => {
                     self.transcript.blank();
-                    let at = self.transcript.entries.len();
-                    self.transcript.replace_from(at, 2, Style::new(), &text);
+                    self.transcript.line(2, Style::new(), text);
                 }
                 None => {}
             },
@@ -438,13 +467,13 @@ impl App {
                 // back rather than repeating the code a second time below it.
                 let at = match self.writing_at.take() {
                     Some(at) => {
-                        self.transcript.replace_line(at, running);
+                        self.transcript.replace_line(at, running, Some(FLEX_SPAN));
                         at
                     }
                     None => {
                         self.transcript.blank();
                         let at = self.transcript.entries.len();
-                        self.transcript.push_ready(running);
+                        self.transcript.push_ready(running, Some(FLEX_SPAN));
                         at
                     }
                 };
@@ -505,7 +534,7 @@ impl App {
             &tool.code,
             format!(" · ↑ {sent}{back} lines · {}", took(ms)),
         );
-        self.transcript.replace_line(tool.at, head);
+        self.transcript.replace_line(tool.at, head, Some(FLEX_SPAN));
         if !ok {
             for line in tool.code.lines() {
                 // A gutter mark on an empty line is a mark with nothing to point at.
@@ -1179,6 +1208,63 @@ mod tests {
         );
     }
 
+    /// Only a line that named a span it can give up loses one. Every ready-made line used
+    /// to lose its third span whatever it held, which for the lockup is the company's name.
+    #[test]
+    fn only_the_span_a_line_named_gives_way_when_it_does_not_fit() {
+        let crowded = || {
+            Line::from(vec![
+                Span::raw("aaaa"),
+                Span::raw("bbbb"),
+                Span::raw("cccccccc"),
+            ])
+        };
+
+        let mut step = Transcript::default();
+        step.push_ready(crowded(), Some(FLEX_SPAN));
+        step.rewrap(10);
+        assert!(
+            step.wrapped[0].spans[FLEX_SPAN].content.ends_with('…'),
+            "a step gives up its glimpse of code: {:?}",
+            step.wrapped[0]
+        );
+
+        let mut lockup = Transcript::default();
+        lockup.push_ready(crowded(), None);
+        lockup.rewrap(10);
+        assert_eq!(
+            lockup.wrapped[0].spans[FLEX_SPAN].content, "cccccccc",
+            "a line that named no flexible span keeps all of them"
+        );
+
+        // And the lockup is such a line.
+        let mut app = App::new();
+        app.transcript.rewrap(12);
+        assert_eq!(
+            app.transcript.wrapped[2].spans[FLEX_SPAN].content,
+            WORDMARK,
+            "the wordmark is not something the mark is willing to lose"
+        );
+    }
+
+    /// A provider's failure arrives as one string with newlines in it, and `wrap` breaks
+    /// on width alone: an entry that kept its `\n` would draw it as a control character.
+    #[test]
+    fn a_multi_line_error_becomes_one_transcript_line_each() {
+        let mut app = App::new();
+        app.transcript
+            .line(0, Style::new(), "provider returned 500:\n<html>\nbad gateway");
+
+        let rows: Vec<String> = screen(&mut app, 40, 12)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            rows.iter().any(|row| row.trim() == "<html>"),
+            "each line stands on its own row: {rows:#?}"
+        );
+    }
+
     #[test]
     fn a_question_is_banded_across_the_whole_width() {
         let agent = Uuid::now_v7();
@@ -1365,6 +1451,79 @@ mod tests {
         );
     }
 
+    /// Only the entries from the first changed one are laid out again, so what that
+    /// leaves behind has to be what laying the whole transcript out afresh would give.
+    #[test]
+    fn a_kept_layout_matches_one_done_from_scratch() {
+        let agent = Uuid::now_v7();
+        let mut app = App::new();
+        for event in [
+            Event::UserMessage {
+                turn_id: agent,
+                text: "go".into(),
+            },
+            Event::ThinkingDelta {
+                agent,
+                text: "weighing\nit ".into(),
+            },
+            Event::ThinkingDelta {
+                agent,
+                text: "up".into(),
+            },
+            Event::MessageDelta {
+                agent,
+                text: "a partial answer long enough to wrap more than once".into(),
+            },
+            Event::CodeDelta {
+                agent,
+                text: "print(1)".into(),
+            },
+            Event::ToolStart {
+                agent,
+                call_id: "c1".into(),
+                name: "python".into(),
+                args: json!({ "code": "print(1)" }),
+            },
+            Event::ToolStream {
+                agent,
+                call_id: "c1".into(),
+                text: "one\ntwo\n".into(),
+            },
+            Event::ToolEnd {
+                agent,
+                call_id: "c1".into(),
+                ok: false,
+                summary: "boom".into(),
+                ms: 3,
+            },
+            Event::MessageDelta {
+                agent,
+                text: "leaked".into(),
+            },
+            Event::Answer {
+                agent,
+                text: "corrected\nanswer".into(),
+            },
+        ] {
+            app.on_event(event);
+            app.transcript.rewrap(30);
+            let kept = app.transcript.wrapped.clone();
+
+            // Nothing carried over: every entry laid out again.
+            app.transcript.dirty = Some(0);
+            app.transcript.rewrap(30);
+            assert_eq!(
+                kept, app.transcript.wrapped,
+                "the kept layout drifted from a fresh one"
+            );
+            assert_eq!(
+                app.transcript.starts.len(),
+                app.transcript.entries.len(),
+                "one recorded start per entry"
+            );
+        }
+    }
+
     #[test]
     fn typing_while_the_agent_works_waits_for_the_next_turn() {
         let mut app = App::new();
@@ -1403,3 +1562,4 @@ mod tests {
         assert!(app.input.is_empty());
     }
 }
+
