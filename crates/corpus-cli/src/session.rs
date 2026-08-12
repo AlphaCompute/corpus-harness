@@ -162,8 +162,6 @@ impl Session for Local {
             };
             self.remember(&event);
             on_event(event);
-            // Whatever else is already here goes in the same telling: eight children
-            // coming back must be one turn and not eight.
             while let Ok(event) = self.children.try_recv() {
                 self.remember(&event);
                 on_event(event);

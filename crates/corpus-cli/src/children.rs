@@ -293,11 +293,9 @@ pub fn doorbell(news: &[Event]) -> Option<String> {
         .collect();
     match lines.is_empty() {
         true => None,
-        false => Some(format!(
-            "{}\nTake the whole of an answer with result(), from the handle you kept or \
-             from agents().",
-            lines.join("\n")
-        )),
+        // Where the rest of an answer is kept is in the prompt, said once for the session
+        // rather than again on every child that comes back.
+        false => Some(lines.join("\n")),
     }
 }
 

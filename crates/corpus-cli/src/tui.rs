@@ -53,13 +53,7 @@ fn preview(code: &str) -> String {
             0
         }
     };
-    let chosen = lines.iter().copied().min_by_key(rank).unwrap_or_default();
-
-    let line: String = chosen.split_whitespace().collect::<Vec<_>>().join(" ");
-    match line.chars().count() > 64 {
-        true => ellipsize(&line, 63),
-        false => line,
-    }
+    one_line(lines.iter().copied().min_by_key(rank).unwrap_or_default())
 }
 
 /// A task as one line of a transcript. Unlike a cell, what a child was asked is prose:

@@ -407,18 +407,8 @@ impl Agent {
         self.turn(prompt, false, on_event).await
     }
 
-    /// A turn started by what the children reported rather than by a person. It is the
-    /// same turn in every other way; only what the log records, and what the model is
-    /// told it is reading, differ.
-    pub async fn notified(
-        &mut self,
-        text: &str,
-        on_event: &mut (dyn FnMut(Event) + Send),
-    ) -> Result<Outcome> {
-        self.turn(text, true, on_event).await
-    }
-
-    /// One turn, from a person or from the children. Whoever drives a session picks
+    /// One turn, from a person or from the children — the difference is what the log
+    /// records and what the model is told it is reading. Whoever drives a session picks
     /// which at run time, so the two cannot be separate methods: they would be two
     /// different futures to hold in one place.
     pub async fn turn(
