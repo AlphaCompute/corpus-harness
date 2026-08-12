@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc;
 
-use crate::session::Session;
+use crate::session::{Prompt, Session, deliver};
 use crate::{MARK, Opening, Sink, WORDMARK};
 
 const ACCENT: Color = Color::Cyan;
@@ -462,6 +462,8 @@ impl App {
                 self.answer_at = None;
                 self.transcript.blank();
                 self.transcript.line(0, muted(), format!("· {text}"));
+                // Nobody pressed anything, so nothing else has said the session is working.
+                self.busy_with("thinking");
             }
             Event::AgentStart { agent, task, .. } => {
                 self.answer_at = None;
@@ -871,12 +873,30 @@ fn drive(
     tx: mpsc::UnboundedSender<Msg>,
 ) {
     tokio::spawn(async move {
-        while let Some(prompt) = prompts.recv().await {
-            let result = session
-                .run(&prompt, &mut |event| {
-                    let _ = tx.send(Msg::Event(sink.emit(event)));
-                })
-                .await;
+        loop {
+            // A person typing and the children reporting back are the two things that
+            // start a turn, and between turns both are waited on at once.
+            let mut show = |event| {
+                let _ = tx.send(Msg::Event(sink.emit(event)));
+            };
+            let next = tokio::select! {
+                prompt = prompts.recv() => match prompt {
+                    Some(text) => Some(Prompt::Human(text)),
+                    None => break,
+                },
+                news = session.idle(&mut show) => match news {
+                    Ok(news) => news.map(Prompt::Notice),
+                    Err(error) => {
+                        let _ = tx.send(Msg::Failed(format!("{error:#}")));
+                        None
+                    }
+                },
+            };
+            let Some(prompt) = next else { continue };
+            let result = deliver(session.as_mut(), prompt, &mut |event| {
+                let _ = tx.send(Msg::Event(sink.emit(event)));
+            })
+            .await;
             let _ = match result {
                 Ok(()) => tx.send(Msg::TurnDone),
                 Err(error) => tx.send(Msg::Failed(format!("{error:#}"))),

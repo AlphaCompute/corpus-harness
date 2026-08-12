@@ -410,7 +410,10 @@ impl Agent {
         self.turn(text, true, on_event).await
     }
 
-    async fn turn(
+    /// One turn, from a person or from the children. Whoever drives a session picks
+    /// which at run time, so the two cannot be separate methods: they would be two
+    /// different futures to hold in one place.
+    pub async fn turn(
         &mut self,
         prompt: &str,
         from_children: bool,

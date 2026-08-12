@@ -259,6 +259,40 @@ fn leaf(recipe: &Recipe, id: Uuid) -> Agent {
     )
 }
 
+/// What the children finishing is worth saying to whoever sent them: which one, how it
+/// went, and enough to decide whether to go and read the rest. Not the rest itself — an
+/// answer pasted here would sit in the context forever, where compaction cannot reach a
+/// user message, and it is one `result()` away in any case.
+pub fn doorbell(news: &[Event]) -> Option<String> {
+    let lines: Vec<String> = news
+        .iter()
+        .filter_map(|event| match event {
+            Event::AgentEnd {
+                agent,
+                ok,
+                chars,
+                preview,
+                ..
+            } => Some(format!(
+                "agent {agent} {} · {chars} chars · {preview}",
+                match ok {
+                    true => "finished",
+                    false => "failed",
+                }
+            )),
+            _ => None,
+        })
+        .collect();
+    match lines.is_empty() {
+        true => None,
+        false => Some(format!(
+            "{}\nTake the whole of an answer with result(), from the handle you kept or \
+             from agents().",
+            lines.join("\n")
+        )),
+    }
+}
+
 fn opening(text: &str) -> String {
     match text.chars().count() > PREVIEW {
         true => text.chars().take(PREVIEW).chain("…".chars()).collect(),

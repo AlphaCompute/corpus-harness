@@ -10,17 +10,65 @@ use tokio::process::{Child, ChildStdout};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// What a turn starts from: a person, or the children reporting back. Whoever drives a
+/// session hands one of these back rather than running a turn from inside a `select!`,
+/// where the arm that produced it is still holding the renderer.
+pub enum Prompt {
+    Human(String),
+    Notice(String),
+}
+
 /// One turn of conversation, wherever the loop actually runs. The renderer holds this
 /// and cannot tell a local agent from one behind a pipe — that is the whole point.
 #[async_trait]
 pub trait Session: Send {
     async fn run(&mut self, prompt: &str, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<()>;
 
+    /// A turn started by what the children reported rather than by a person.
+    async fn notified(
+        &mut self,
+        news: &str,
+        on_event: &mut (dyn FnMut(Event) + Send),
+    ) -> Result<()>;
+
+    /// What the session does while nobody is typing. It renders whatever happens on its
+    /// own — children start, work and come back between turns — and returns the news that
+    /// is worth a turn of its own, or nothing when there is none to be had. Never returns
+    /// on an idle session, and safe to drop the moment a person types.
+    async fn idle(&mut self, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<Option<String>>;
+
     async fn finish(&mut self, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<()>;
 
     /// Taken before the session starts running, and usable while it does.
     fn interrupt(&self) -> Interrupt;
 }
+
+/// Kept for the boundary. A free function because a turn has the session taken apart
+/// field by field, which is what lets a child be heard while its parent is thinking.
+fn keep(news: &mut Vec<Event>, event: &Event) {
+    if matches!(event, Event::AgentEnd { .. }) {
+        news.push(event.clone());
+    }
+}
+
+/// Runs whichever kind of turn this is. Every driver has both cases and none of them
+/// needs to know how they differ.
+pub async fn deliver(
+    session: &mut dyn Session,
+    prompt: Prompt,
+    on_event: &mut (dyn FnMut(Event) + Send),
+) -> Result<()> {
+    match prompt {
+        Prompt::Human(text) => session.run(&text, on_event).await,
+        Prompt::Notice(text) => session.notified(&text, on_event).await,
+    }
+}
+
+/// How many turns a session may take on what its children said before it waits to be
+/// spoken to again. Each one is a whole turn under its own budget, so the ceiling is not
+/// about cost but about a session that answers itself: children reporting to children.
+/// Only a person typing resets it.
+const AUTONOMOUS: u32 = 8;
 
 /// What `corpus connect` writes to `corpus serve`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +87,12 @@ pub struct Local {
     /// Everything the children say. It is drained alongside the turn rather than by it,
     /// because a child talks while its parent is thinking and neither waits on the other.
     children: mpsc::UnboundedReceiver<Event>,
+    /// Turns taken since a person last said anything.
+    autonomous: u32,
+    /// Children that came back and have not been reported yet. A child finishing while
+    /// its parent was busy is exactly the case notifying exists for, so what lands mid-turn
+    /// waits here for the boundary rather than being shown and forgotten.
+    news: Vec<Event>,
 }
 
 impl Local {
@@ -48,6 +102,8 @@ impl Local {
             model: Some(model),
             agent,
             children,
+            autonomous: 0,
+            news: Vec::new(),
         }
     }
 }
@@ -55,6 +111,70 @@ impl Local {
 #[async_trait]
 impl Session for Local {
     async fn run(&mut self, prompt: &str, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<()> {
+        self.autonomous = 0;
+        self.turn(prompt, false, on_event).await
+    }
+
+    async fn notified(
+        &mut self,
+        news: &str,
+        on_event: &mut (dyn FnMut(Event) + Send),
+    ) -> Result<()> {
+        self.turn(news, true, on_event).await
+    }
+
+    /// Waits for a child to come back, showing whatever else happens on the way, and folds
+    /// everything that has landed since the last boundary into one telling: eight children
+    /// finishing must be one turn, not eight.
+    async fn idle(&mut self, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<Option<String>> {
+        loop {
+            // At the ceiling this simply never comes true: the session goes on showing
+            // what its children do and waits to be spoken to. Nothing is lost — the
+            // answers are where they always were, in the agents that hold them.
+            if !self.news.is_empty() && self.autonomous < AUTONOMOUS {
+                self.autonomous += 1;
+                return Ok(crate::children::doorbell(&std::mem::take(&mut self.news)));
+            }
+            let Some(event) = self.children.recv().await else {
+                // Nobody is left to say anything, which is not an answer this can give.
+                return std::future::pending().await;
+            };
+            self.remember(&event);
+            on_event(event);
+            // Whatever else is already here goes in the same telling: eight children
+            // coming back must be one turn and not eight.
+            while let Ok(event) = self.children.try_recv() {
+                self.remember(&event);
+                on_event(event);
+            }
+        }
+    }
+
+    async fn finish(&mut self, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<()> {
+        on_event(Event::SessionEnd {
+            session_id: self.session_id,
+        });
+        Ok(())
+    }
+
+    fn interrupt(&self) -> Interrupt {
+        self.agent.interrupter()
+    }
+}
+
+impl Local {
+    fn remember(&mut self, event: &Event) {
+        if matches!(event, Event::AgentEnd { .. }) {
+            self.news.push(event.clone());
+        }
+    }
+
+    async fn turn(
+        &mut self,
+        prompt: &str,
+        from_children: bool,
+        on_event: &mut (dyn FnMut(Event) + Send),
+    ) -> Result<()> {
         if let Some(model) = self.model.take() {
             on_event(Event::SessionStart {
                 session_id: self.session_id,
@@ -67,20 +187,26 @@ impl Session for Local {
         // draining the children only when the parent happens to say something — gets
         // wrong anyway, because a parent waiting on a child says nothing for minutes.
         let Local {
-            agent, children, ..
+            agent,
+            children,
+            news,
+            ..
         } = self;
         let (told, mut mine) = mpsc::unbounded_channel();
         let mut sending = move |event| {
             let _ = told.send(event);
         };
-        let turn = agent.run(prompt, &mut sending);
+        let turn = agent.turn(prompt, from_children, &mut sending);
         tokio::pin!(turn);
         let outcome = loop {
             tokio::select! {
                 biased;
                 outcome = &mut turn => break outcome,
                 Some(event) = mine.recv() => on_event(event),
-                Some(event) = children.recv() => on_event(event),
+                Some(event) = children.recv() => {
+                    keep(news, &event);
+                    on_event(event);
+                }
             }
         };
         // The turn ends holding whatever it said last, `TurnEnd` among it: a caller that
@@ -89,21 +215,11 @@ impl Session for Local {
             on_event(event);
         }
         while let Ok(event) = children.try_recv() {
+            keep(news, &event);
             on_event(event);
         }
         outcome?;
         Ok(())
-    }
-
-    async fn finish(&mut self, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<()> {
-        on_event(Event::SessionEnd {
-            session_id: self.session_id,
-        });
-        Ok(())
-    }
-
-    fn interrupt(&self) -> Interrupt {
-        self.agent.interrupter()
     }
 }
 
@@ -171,6 +287,18 @@ impl Session for Remote {
         })?;
         self.pump(on_event, |event| matches!(event, Event::TurnEnd { .. }))
             .await
+    }
+
+    /// The children live where the loop does, so a turn started by their news is started
+    /// over there. This side only has to keep reading: an autonomous turn nobody read for
+    /// would be invisible here until somebody typed.
+    async fn notified(&mut self, _: &str, _: &mut (dyn FnMut(Event) + Send)) -> Result<()> {
+        bail!("a served session starts its own turns")
+    }
+
+    async fn idle(&mut self, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<Option<String>> {
+        self.pump(on_event, |_| false).await?;
+        std::future::pending().await
     }
 
     async fn finish(&mut self, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<()> {

@@ -17,7 +17,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::children::{Children, Recipe};
 use crate::host::Tools;
-use crate::session::{Command as Wire, Local as LocalSession, Remote, Session};
+use crate::session::{
+    Command as Wire, Local as LocalSession, Prompt, Remote, Session, deliver,
+};
 
 /// The lockup, kept in one place so the TUI and the plain renderer open a session the
 /// same way: the rayed mark on the left, the product over the company beside it.
@@ -533,7 +535,9 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
     ))
 }
 
-/// One prompt, or a prompt at a time from stdin until it ends.
+/// One prompt, or a prompt at a time from stdin until it ends. Between prompts the
+/// session is not idle in the sense of stopped: children it sent off are still working,
+/// and what they report is a turn of its own.
 async fn drive(session: &mut dyn Session, prompt: Option<String>, sink: &mut Sink) -> Result<()> {
     let mut record = |event| {
         sink.emit(event);
@@ -542,15 +546,23 @@ async fn drive(session: &mut dyn Session, prompt: Option<String>, sink: &mut Sin
         Some(prompt) => session.run(&prompt, &mut record).await?,
         None => {
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
-            while let Some(line) = lines.next_line().await? {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
+            loop {
+                // Whichever arrives first is taken out of the race before it is run: the
+                // arm that produced it is still holding the renderer the turn needs.
+                let next = tokio::select! {
+                    line = lines.next_line() => match line? {
+                        None => break,
+                        Some(line) => match line.trim() {
+                            "" => None,
+                            "/exit" => break,
+                            typed => Some(Prompt::Human(typed.to_string())),
+                        },
+                    },
+                    news = session.idle(&mut record) => news?.map(Prompt::Notice),
+                };
+                if let Some(prompt) = next {
+                    deliver(session, prompt, &mut record).await?;
                 }
-                if line == "/exit" {
-                    break;
-                }
-                session.run(line, &mut record).await?;
             }
         }
     }
@@ -583,39 +595,40 @@ async fn serve() -> Result<()> {
 
     let mut leaving = false;
     while !leaving {
-        let Some(command) = commands.recv().await else {
-            break;
+        let mut record = |event| {
+            sink.emit(event);
         };
-        match command {
-            Wire::Exit => break,
-            Wire::Interrupt => {}
-            Wire::Run { text } => {
-                let mut record = |event| {
-                    sink.emit(event);
-                };
-                let turn = session.run(&text, &mut record);
-                tokio::pin!(turn);
-                let outcome = loop {
-                    tokio::select! {
-                        // A finished turn wins the race: an `exit` read in the same
-                        // moment must still be obeyed after it, not swallowed here.
-                        biased;
-                        result = &mut turn => break result,
-                        Some(command) = commands.recv() => match command {
-                            Wire::Interrupt => interrupt.raise(),
-                            // `connect` reads a turn to its end before sending another,
-                            // so a run arriving here is a client bug, not a queue.
-                            Wire::Run { .. } => {}
-                            Wire::Exit => {
-                                leaving = true;
-                                interrupt.raise();
-                            }
-                        },
+        let next = tokio::select! {
+            command = commands.recv() => match command {
+                None | Some(Wire::Exit) => break,
+                Some(Wire::Interrupt) => None,
+                Some(Wire::Run { text }) => Some(Prompt::Human(text)),
+            },
+            // A served session is a session: its children report to it, not down the pipe.
+            news = session.idle(&mut record) => news?.map(Prompt::Notice),
+        };
+        let Some(prompt) = next else { continue };
+        let turn = deliver(&mut session, prompt, &mut record);
+        tokio::pin!(turn);
+        let outcome = loop {
+            tokio::select! {
+                // A finished turn wins the race: an `exit` read in the same
+                // moment must still be obeyed after it, not swallowed here.
+                biased;
+                result = &mut turn => break result,
+                Some(command) = commands.recv() => match command {
+                    Wire::Interrupt => interrupt.raise(),
+                    // `connect` reads a turn to its end before sending another,
+                    // so a run arriving here is a client bug, not a queue.
+                    Wire::Run { .. } => {}
+                    Wire::Exit => {
+                        leaving = true;
+                        interrupt.raise();
                     }
-                };
-                outcome?;
+                },
             }
-        }
+        };
+        outcome?;
     }
     session
         .finish(&mut |event| {

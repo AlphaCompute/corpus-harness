@@ -130,6 +130,92 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
     );
 }
 
+/// A child coming back rings the doorbell: the session takes a turn nobody typed, and is
+/// told which agent finished and roughly what it holds — not the answer itself, which is
+/// one `result()` away and would otherwise sit in the context for good.
+#[tokio::test]
+async fn an_agent_coming_back_is_a_turn_the_session_takes_on_its_own() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let long = "The numbers are 3, 5 and 8, and here is a great deal more about them: "
+        .repeat(6);
+    let endpoint = serve(vec![
+        runs_python(
+            "call_1",
+            "kid = spawn('dig up the numbers')\nwhile kid.result(timeout=10) is None: pass\n",
+        ),
+        says(&long),
+        says("One is off digging."),
+        says("Right, it came back with the numbers."),
+    ])
+    .await;
+
+    let mut child = tokio::process::Command::new(BIN)
+        .env("CORPUS_BASE_URL", &endpoint.url)
+        .env("CORPUS_API_KEY", "test-key")
+        .env("CORPUS_MODEL", "test-model")
+        .env("CORPUS_KERNEL_DIR", kernel_dir())
+        .arg("serve")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+
+    let session = async {
+        stdin
+            .write_all(b"{\"cmd\":\"run\",\"text\":\"Find the numbers.\"}\n")
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        let mut told = false;
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            // Every agent's turns are in this stream, the child's among them, so the end
+            // being waited for is the end of the turn the news itself started.
+            let done = told && event["t"] == "turn_end";
+            told |= event["t"] == "notice";
+            seen.push(event);
+            if done {
+                break;
+            }
+        }
+        seen
+    };
+
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(60), session)
+        .await
+        .expect("the session never took the turn its child's news is for");
+
+    let notice = seen
+        .iter()
+        .find(|event| event["t"] == "notice")
+        .expect("news from the children is its own kind of event, not a forged question");
+    let told = notice["text"].as_str().unwrap();
+    assert!(
+        told.contains("finished") && told.contains("The numbers are 3, 5 and 8"),
+        "the doorbell says who finished and enough to place it: {told}"
+    );
+    assert!(
+        told.chars().count() < long.chars().count(),
+        "a doorbell is not the delivery: {told}"
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|event| event["t"] == "user_message" && event["agent"] == notice["agent"])
+            .count(),
+        1,
+        "the session was asked one thing by a person, and that is the only question in it"
+    );
+    let woken = endpoint.requests().last().unwrap().clone();
+    assert!(
+        woken.contains("not the person you are talking to"),
+        "the model must be able to tell who is talking: {woken}"
+    );
+}
+
 /// One cell sends an agent off and waits for it in a loop, which is the shape the prompt
 /// asks for. Three model calls: the cell, the child's turn, and the answer that follows.
 #[tokio::test]
