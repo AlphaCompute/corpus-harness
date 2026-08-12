@@ -68,9 +68,17 @@ async fn a_local_run_draws_the_stream_and_writes_the_log() {
     )
     .await;
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Paris."),
+        stdout.contains("Paris."),
         "the answer must reach the terminal as it streams"
+    );
+    assert!(
+        stdout.starts_with(&format!(
+            " \\|/\n -*-  corpus v{} · test-model\n /|\\  by ALPHA COMPUTE\n",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "a run opens under the mark, unstyled into a pipe: {stdout}"
     );
     let kinds: Vec<_> = transcript(&log)
         .iter()
@@ -87,6 +95,35 @@ async fn a_local_run_draws_the_stream_and_writes_the_log() {
             "turn_end",
             "session_end"
         ]
+    );
+}
+
+/// A session leaves nothing on disk unless it was asked to.
+#[tokio::test]
+async fn the_log_is_written_only_when_asked_for() {
+    let dir = workdir("opt-in-log");
+    let endpoint = serve(vec![says("Paris."), says("Paris.")]).await;
+
+    let mut quiet = command(&endpoint);
+    quiet.arg("Capital of France?").current_dir(&dir);
+    assert!(quiet.output().await.unwrap().status.success());
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        0,
+        "an unasked-for session log was written"
+    );
+
+    let logs = dir.join("logs");
+    corpus(
+        &endpoint,
+        &["Capital of France?"],
+        &[("CORPUS_LOG", logs.to_str().unwrap())],
+    )
+    .await;
+    let written = std::fs::read_dir(&logs).unwrap().next().unwrap().unwrap();
+    assert!(
+        !transcript(&written.path()).is_empty(),
+        "CORPUS_LOG named a directory and nothing landed in it"
     );
 }
 
