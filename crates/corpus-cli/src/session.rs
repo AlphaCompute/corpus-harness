@@ -36,14 +36,18 @@ pub struct Local {
     /// Taken by the announcement, which is what makes it happen once.
     model: Option<String>,
     agent: Agent,
+    /// Everything the children say. It is drained alongside the turn rather than by it,
+    /// because a child talks while its parent is thinking and neither waits on the other.
+    children: mpsc::UnboundedReceiver<Event>,
 }
 
 impl Local {
-    pub fn new(agent: Agent, model: String) -> Local {
+    pub fn new(agent: Agent, model: String, children: mpsc::UnboundedReceiver<Event>) -> Local {
         Local {
             session_id: Uuid::now_v7(),
             model: Some(model),
             agent,
+            children,
         }
     }
 }
@@ -57,7 +61,37 @@ impl Session for Local {
                 model,
             });
         }
-        self.agent.run(prompt, on_event).await?;
+        // The turn's own events go down a channel rather than into `on_event`, so that
+        // one caller is left holding it: the arms below. Sharing it with the children's
+        // stream is what the borrow checker will not have, and what the alternative —
+        // draining the children only when the parent happens to say something — gets
+        // wrong anyway, because a parent waiting on a child says nothing for minutes.
+        let Local {
+            agent, children, ..
+        } = self;
+        let (told, mut mine) = mpsc::unbounded_channel();
+        let mut sending = move |event| {
+            let _ = told.send(event);
+        };
+        let turn = agent.run(prompt, &mut sending);
+        tokio::pin!(turn);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                outcome = &mut turn => break outcome,
+                Some(event) = mine.recv() => on_event(event),
+                Some(event) = children.recv() => on_event(event),
+            }
+        };
+        // The turn ends holding whatever it said last, `TurnEnd` among it: a caller that
+        // learns the turn is over before it hears the end of it has been told twice.
+        while let Ok(event) = mine.try_recv() {
+            on_event(event);
+        }
+        while let Ok(event) = children.try_recv() {
+            on_event(event);
+        }
+        outcome?;
         Ok(())
     }
 

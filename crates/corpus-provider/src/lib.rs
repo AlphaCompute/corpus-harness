@@ -284,7 +284,11 @@ pub struct Model {
     pub window: u32,
 }
 
+#[derive(Clone)]
 pub struct Provider {
+    /// Cloned rather than built a second time wherever another agent needs one: the clone
+    /// shares this one's connection pool and its trace file, which is what a child of this
+    /// session should be speaking through anyway.
     http: reqwest::Client,
     base_url: String,
     api_key: String,

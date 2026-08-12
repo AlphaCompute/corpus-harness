@@ -28,6 +28,7 @@ async fn agent(endpoint: &Endpoint, host: Arc<Recorder>, budget: Budget) -> Agen
         .await
         .unwrap();
     Agent::new(
+        uuid::Uuid::now_v7(),
         Provider::new(&endpoint.url, "test-key", "test-model"),
         kernel,
         host,
@@ -43,6 +44,49 @@ async fn ask(agent: &mut Agent, prompt: &str) -> (Outcome, Vec<Event>) {
         .await
         .unwrap();
     (outcome, events)
+}
+
+/// An agent that reads what it was sent and answers should cost a model call and nothing
+/// else. An interpreter is eighteen megabytes and a process; multiplied by however many
+/// children a session sends off, it is worth not paying for until a cell is written.
+#[tokio::test]
+async fn an_interpreter_is_started_by_the_first_cell_and_not_before() {
+    let endpoint = serve(vec![
+        says("Nothing to run."),
+        runs_python("call_1", "print(6 * 7)"),
+        says("42."),
+    ])
+    .await;
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = started.clone();
+    let start = corpus_agent::Kernels::new(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async { Kernel::start("python3", &kernel_dir(), &["web_search"]).await }
+    });
+    let mut agent = Agent::lazy(
+        uuid::Uuid::now_v7(),
+        Provider::new(&endpoint.url, "test-key", "test-model"),
+        start,
+        Arc::new(Recorder::default()),
+        "You are Corpus.",
+        Budget::default(),
+    );
+
+    let (answer, _) = ask(&mut agent, "Say something.").await;
+    assert_eq!(answer.text, "Nothing to run.");
+    assert_eq!(
+        started.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an agent that wrote no cell paid for an interpreter"
+    );
+
+    let (used, _) = ask(&mut agent, "Now count something.").await;
+    assert_eq!(used.text, "42.");
+    assert_eq!(
+        started.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the first cell must start one, and only the first"
+    );
 }
 
 #[tokio::test]

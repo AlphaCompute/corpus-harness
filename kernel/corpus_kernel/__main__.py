@@ -163,13 +163,50 @@ def _run(cell_id, code, ns):
         _current_id = ""
 
 
+def _bind(ns, fns):
+    """Binds the host's functions, and the one object the cell would otherwise have to
+    build for itself: an agent read back from an id is three calls that all take the same
+    id, and the model writing that by hand is the wrapper we would rather it did not.
+
+    Depth lives in `fns` and nowhere else: with no `spawn` in the list there is no agent
+    class, no `agents()`, and nothing in the namespace to suggest either exists.
+    """
+    raw = {name: _host_fn(name) for name in fns}
+    ns.update({name: call for name, call in raw.items() if name not in ("result", "send", "done")})
+    if "spawn" not in raw:
+        return
+
+    class Agent:
+        __slots__ = ("id", "task")
+
+        def __init__(self, id, task=""):
+            self.id = id
+            self.task = task
+
+        def result(self, timeout=30):
+            """What its last finished turn answered, or None while it is still working."""
+            return raw["result"](agent=self.id, timeout=timeout)
+
+        def send(self, text):
+            """Another turn for it; it takes this one when the one it is on is done."""
+            return raw["send"](agent=self.id, text=text)
+
+        def done(self):
+            return raw["done"](agent=self.id)
+
+        def __repr__(self):
+            return f"<agent {self.id}: {self.task}>"
+
+    ns["spawn"] = lambda task: Agent(raw["spawn"](task=task), task)
+    ns["agents"] = lambda: [Agent(kid["agent"], kid["task"]) for kid in raw["agents"]()]
+
+
 def main():
     init = json.loads(sys.stdin.readline())
     # `_` is bound from the start, so a peek written before anything returned a value
     # reads as empty rather than raising over a name the prompt promised.
     ns = {"__name__": "__corpus__", "HostError": HostError, "_": ""}
-    for name in init.get("fns", []):
-        ns[name] = _host_fn(name)
+    _bind(ns, init.get("fns", []))
 
     sys.stdout = _StreamProxy()
     sys.stderr = _StreamProxy()

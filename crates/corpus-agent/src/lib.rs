@@ -1,7 +1,9 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use corpus_kernel::{Host, Kernel};
 use corpus_provider::{Delta, Message, Provider, Role, StopReason, Tool, ToolCall, Usage};
 use serde::{Deserialize, Serialize};
@@ -193,13 +195,32 @@ pub struct Outcome {
     pub usage: Usage,
 }
 
+/// How to start an interpreter, for an agent that may never ask for one. An agent that
+/// only reads what it was sent and answers costs nothing but the model call.
+pub struct Kernels(
+    Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Kernel>> + Send>> + Send + Sync>,
+);
+
+impl Kernels {
+    pub fn new<F>(start: impl Fn() -> F + Send + Sync + 'static) -> Kernels
+    where
+        F: Future<Output = Result<Kernel>> + Send + 'static,
+    {
+        Kernels(Box::new(move || Box::pin(start())))
+    }
+}
+
 pub struct Agent {
     pub id: Uuid,
     /// A monotonic counter rather than a flag: a receiver taken at the start of a turn
     /// only ever sees interrupts raised after it, so a stale one cannot kill the next turn.
     cancel: tokio::sync::watch::Sender<u64>,
     provider: Provider,
-    kernel: Kernel,
+    kernel: Option<Kernel>,
+    start: Option<Kernels>,
+    /// Filled the moment a kernel exists, because whoever holds the interrupt took it
+    /// before the first cell was ever written.
+    stop: Arc<std::sync::Mutex<Option<corpus_kernel::Interrupter>>>,
     host: Arc<dyn Host>,
     messages: Vec<Message>,
     tools: Vec<Tool>,
@@ -207,18 +228,49 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// An agent whose interpreter is already running, which is worth the wait only where
+    /// something else was being waited on anyway. The id comes from outside: whoever
+    /// makes an agent has to be able to say whose events these are before it exists.
     pub fn new(
+        id: Uuid,
         provider: Provider,
         kernel: Kernel,
         host: Arc<dyn Host>,
         system_prompt: &str,
         budget: Budget,
     ) -> Agent {
+        Agent::build(id, provider, Some(kernel), None, host, system_prompt, budget)
+    }
+
+    /// An agent that starts its interpreter the first time it writes a cell.
+    pub fn lazy(
+        id: Uuid,
+        provider: Provider,
+        start: Kernels,
+        host: Arc<dyn Host>,
+        system_prompt: &str,
+        budget: Budget,
+    ) -> Agent {
+        Agent::build(id, provider, None, Some(start), host, system_prompt, budget)
+    }
+
+    fn build(
+        id: Uuid,
+        provider: Provider,
+        kernel: Option<Kernel>,
+        start: Option<Kernels>,
+        host: Arc<dyn Host>,
+        system_prompt: &str,
+        budget: Budget,
+    ) -> Agent {
+        let stop = kernel.as_ref().map(Kernel::interrupter);
         Agent {
-            id: Uuid::now_v7(),
+            id,
             cancel: tokio::sync::watch::channel(0).0,
             provider,
             kernel,
+            start,
+            stop: Arc::new(std::sync::Mutex::new(stop)),
             host,
             messages: vec![Message::text(Role::System, system_prompt)],
             tools: vec![Tool {
@@ -240,11 +292,30 @@ impl Agent {
     /// partial answer instead of starting another step.
     pub fn interrupter(&self) -> Interrupt {
         let cancel = self.cancel.clone();
-        let kernel = self.kernel.interrupter();
+        let stop = self.stop.clone();
         Interrupt::new(move || {
             cancel.send_modify(|count| *count += 1);
-            kernel.raise();
+            // Nothing to interrupt is not a failure to interrupt: an agent that has not
+            // written a cell yet is stopped by the counter above and nothing else.
+            if let Some(kernel) = stop.lock().unwrap().as_ref() {
+                kernel.raise();
+            }
         })
+    }
+
+    /// The interpreter, started if this is the first cell to need one.
+    async fn kernel(&mut self) -> Result<&mut Kernel> {
+        if self.kernel.is_none() {
+            let starting = self
+                .start
+                .as_ref()
+                .map(|start| (start.0)())
+                .context("this agent has no interpreter to start")?;
+            let kernel = starting.await?;
+            *self.stop.lock().unwrap() = Some(kernel.interrupter());
+            self.kernel = Some(kernel);
+        }
+        Ok(self.kernel.as_mut().expect("just started"))
     }
 
     /// Rebuilds the model's context from the session log. The kernel namespace does not
@@ -503,13 +574,17 @@ impl Agent {
         let call_id = call.id.clone();
         let started = Instant::now();
         let mut captured = String::new();
+        let host = self.host.clone();
+        let timeout = self.budget.cell_timeout;
+        let code = python_code(&args).unwrap_or_default().to_string();
         // ponytail: a cell that also ignores the interrupt takes the kernel down with it and
         // ends the session. Restarting means rebuilding the namespace, which needs a snapshot.
         let outcome = self
-            .kernel
+            .kernel()
+            .await?
             .exec(
-                python_code(&args).unwrap_or_default(),
-                &self.host,
+                &code,
+                &host,
                 &mut |text| {
                     captured.push_str(text);
                     on_event(Event::ToolStream {
@@ -518,7 +593,7 @@ impl Agent {
                         text: text.into(),
                     });
                 },
-                self.budget.cell_timeout,
+                timeout,
             )
             .await?;
 
