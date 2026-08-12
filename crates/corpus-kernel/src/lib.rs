@@ -54,6 +54,24 @@ enum Frame {
     },
 }
 
+/// What the kernel is handed back after `env_clear`. A toolchain is found through `PATH`
+/// and configured under `HOME`, so a cell that cannot see them cannot run `git`, `cargo`
+/// or anything else the machine has — while a key held in any other variable stays on
+/// this side of the pipe, which is the part that matters. `HOME` opens no door the cell
+/// did not already have: the filesystem is reachable by absolute path regardless.
+const MACHINE_ENV: [&str; 4] = ["PATH", "HOME", "LANG", "TMPDIR"];
+
+fn machine_env() -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = MACHINE_ENV
+        .iter()
+        .filter_map(|name| Some((name.to_string(), std::env::var(name).ok()?)))
+        .collect();
+    if !env.iter().any(|(name, _)| name == "PATH") {
+        env.push(("PATH".into(), "/usr/bin:/bin".into()));
+    }
+    env
+}
+
 /// Reaches a running cell from outside the `exec` that is awaiting it.
 #[derive(Clone)]
 pub struct Interrupter(mpsc::UnboundedSender<String>);
@@ -108,7 +126,7 @@ impl Kernel {
             .arg("corpus_kernel")
             // The kernel runs model-written code: it gets no inherited secrets, ever.
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .envs(machine_env())
             .env("PYTHONPATH", kernel_dir)
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONDONTWRITEBYTECODE", "1")

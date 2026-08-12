@@ -149,16 +149,64 @@ async fn printed_json_cannot_forge_a_protocol_frame() {
 }
 
 #[tokio::test]
-async fn the_kernel_environment_carries_no_secrets() {
+async fn the_kernel_gets_the_machine_but_none_of_its_secrets() {
     unsafe { std::env::set_var("CORPUS_TEST_API_KEY", "sk-secret") };
     let mut kernel = start().await;
     let (outcome, out) = run(
         &mut kernel,
-        "import os\nprint(os.environ.get('CORPUS_TEST_API_KEY'))",
+        "import os\nprint(os.environ.get('CORPUS_TEST_API_KEY'))\nprint(os.environ.get('PATH'))",
     )
     .await;
     assert!(outcome.ok, "{}", outcome.traceback);
-    assert_eq!(out.trim(), "None", "kernel saw the key");
+    let mut lines = out.lines();
+    assert_eq!(lines.next(), Some("None"), "kernel saw the key");
+    assert_eq!(
+        lines.next().unwrap_or_default(),
+        std::env::var("PATH").unwrap_or_default(),
+        "a toolchain the machine has must be reachable from a cell"
+    );
+}
+
+#[tokio::test]
+async fn a_shell_command_reaches_the_model() {
+    let mut kernel = start().await;
+    let (outcome, out) = run(
+        &mut kernel,
+        "import corpus_code\ncorpus_code.sh('echo built && echo broken >&2')",
+    )
+    .await;
+    assert!(outcome.ok, "{}", outcome.traceback);
+    assert!(out.contains("built"), "stdout was swallowed: {out}");
+    assert!(out.contains("broken"), "stderr was swallowed: {out}");
+    assert_eq!(outcome.repr, "0");
+
+    let (failed, out) = run(&mut kernel, "corpus_code.sh('exit 3')").await;
+    assert_eq!(failed.repr, "3");
+    assert!(out.contains("[exit 3]"), "{out}");
+}
+
+#[tokio::test]
+async fn an_edit_lands_once_or_not_at_all() {
+    let mut kernel = start().await;
+    let (outcome, out) = run(
+        &mut kernel,
+        "import corpus_code, pathlib, tempfile\n\
+         page = pathlib.Path(tempfile.mkdtemp()) / 'f.txt'\n\
+         page.write_text('a\\nb\\na\\n')\n\
+         try:\n\
+        \x20   corpus_code.edit(page, 'a', 'c')\n\
+         except ValueError as refusal:\n\
+        \x20   print('refused')\n\
+         corpus_code.edit(page, 'b', 'c')\n\
+         print(page.read_text().replace('\\n', '|'))",
+    )
+    .await;
+    assert!(outcome.ok, "{}", outcome.traceback);
+    assert!(
+        out.contains("refused"),
+        "an ambiguous edit went through: {out}"
+    );
+    assert!(out.contains("a|c|a|"), "{out}");
 }
 
 #[tokio::test]
