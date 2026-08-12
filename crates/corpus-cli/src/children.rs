@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc, watch};
 use uuid::Uuid;
 
-use crate::host::{Tools, fence};
+use crate::host::{Search, Tools, fence};
 
 /// How many children may be taking a turn at once. The rest are not refused — a refusal
 /// would be one more thing for the model to handle — they wait their turn, so a hundred
@@ -39,6 +39,7 @@ pub struct Recipe {
     pub kernel_dir: PathBuf,
     pub provider: Provider,
     pub budget: Budget,
+    pub search: Option<Search>,
 }
 
 /// Where a child is between turns. `running` is not a field: it is `busy || queued > 0`,
@@ -85,6 +86,19 @@ impl Children {
             turns: Arc::new(Semaphore::new(AT_ONCE)),
             kids: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whose session this is. Everything a host function says happens is said in this
+    /// agent's name, because it is the one whose cell asked for it.
+    pub fn parent(&self) -> Uuid {
+        self.parent
+    }
+
+    /// One channel carries everything that happens away from the turn's own loop, and the
+    /// children are only its first users. Nothing waits on the far end: a session that
+    /// stopped listening is a session that is over.
+    pub fn announce(&self, event: Event) {
+        let _ = self.events.send(event);
     }
 
     pub async fn call(&self, name: &str, args: &Value) -> Result<Value, String> {
@@ -261,7 +275,11 @@ fn leaf(recipe: &Recipe, id: Uuid) -> Agent {
         id,
         recipe.provider.clone(),
         start,
-        Arc::new(Tools::new(recipe.provider.clone(), None)),
+        Arc::new(Tools::new(
+            recipe.provider.clone(),
+            recipe.search.clone(),
+            None,
+        )),
         &crate::system_prompt(Some(id)),
         recipe.budget,
     )

@@ -444,3 +444,67 @@ async fn a_child_cannot_send_off_a_child_of_its_own() {
         "a child's namespace must hold the tools and not the delegation: {printed}"
     );
 }
+
+/// Delivery over the whole path: the name is in the cell's namespace, the host checks the
+/// file, and the session's log carries what a consumer needs to go and read it.
+#[tokio::test]
+async fn a_file_a_cell_produced_leaves_the_session_as_an_event() {
+    let dir = workdir("delivery");
+    let log = dir.join("session.jsonl");
+    let writing = "from pathlib import Path\n\
+                   Path('report.md').write_text('# what I found\\n')\n\
+                   print(send_user_file(path='report.md', caption='what I found'))\n\
+                   print('outside:', end=' ')\n\
+                   try:\n\
+                   \x20   send_user_file(path='/etc/hosts')\n\
+                   except HostError as refusal:\n\
+                   \x20   print(refusal)\n";
+    let endpoint = serve(vec![
+        runs_python("call_1", writing),
+        says("Sent the report."),
+    ])
+    .await;
+
+    let output = tokio::process::Command::new(BIN)
+        .current_dir(&dir)
+        .env("CORPUS_BASE_URL", &endpoint.url)
+        .env("CORPUS_API_KEY", "test-key")
+        .env("CORPUS_MODEL", "test-model")
+        .env("CORPUS_KERNEL_DIR", kernel_dir())
+        .args([
+            "Write the report and send it.",
+            "--log",
+            log.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "corpus failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let printed = printed(&log);
+    assert!(
+        printed.contains("outside: refused") && printed.contains("outside the working directory"),
+        "a path out of the working directory is refused in the cell: {printed}"
+    );
+    let sent: Vec<Value> = events(&log)
+        .into_iter()
+        .filter(|event| event["t"] == "user_file")
+        .collect();
+    assert_eq!(sent.len(), 1, "one call, one delivery: {sent:?}");
+    assert_eq!(sent[0]["filename"], "report.md");
+    assert_eq!(sent[0]["bytes"], 15);
+    assert_eq!(sent[0]["caption"], "what I found");
+    assert_eq!(
+        sent[0]["path"],
+        dir.join("report.md")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "the consumer opens this path itself"
+    );
+}

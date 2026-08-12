@@ -92,6 +92,16 @@ pub enum Event {
         summary: String,
         ms: u64,
     },
+    /// A file the session is handing to whoever it is talking to. The bytes stay on disk:
+    /// whoever delivers reads the path itself, so a log keeps the fact of the delivery and
+    /// not a copy of the file.
+    UserFile {
+        agent: Uuid,
+        path: String,
+        filename: String,
+        bytes: u64,
+        caption: Option<String>,
+    },
     Compaction {
         agent: Uuid,
         dropped: usize,
@@ -133,6 +143,7 @@ impl Event {
             | Event::ToolStart { agent, .. }
             | Event::ToolStream { agent, .. }
             | Event::ToolEnd { agent, .. }
+            | Event::UserFile { agent, .. }
             | Event::Compaction { agent, .. }
             | Event::TurnEnd { agent, .. }
             | Event::Answer { agent, .. } => Some(*agent),
