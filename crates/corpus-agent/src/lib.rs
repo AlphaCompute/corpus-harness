@@ -32,7 +32,33 @@ pub enum Event {
     },
     UserMessage {
         turn_id: Uuid,
+        /// Who was asked. Absent from logs written before agents had children, and a log
+        /// that never names one is a log with only a root in it.
+        #[serde(default)]
+        agent: Uuid,
         text: String,
+    },
+    /// A turn nobody typed: what the children have to say, delivered as its prompt. Kept
+    /// apart from a `UserMessage` so a replayed session cannot mistake it for a person.
+    Notice {
+        turn_id: Uuid,
+        agent: Uuid,
+        text: String,
+    },
+    AgentStart {
+        agent: Uuid,
+        parent: Uuid,
+        task: String,
+    },
+    AgentEnd {
+        agent: Uuid,
+        parent: Uuid,
+        ok: bool,
+        chars: usize,
+        /// The opening of what came back — a doorbell, not the delivery. The whole of it
+        /// is fetched from the agent in code, so this is what the parent is told and all
+        /// that a log needs to rebuild the telling.
+        preview: String,
     },
     ThinkingDelta {
         agent: Uuid,
@@ -86,6 +112,36 @@ pub enum Event {
     SessionEnd {
         session_id: Uuid,
     },
+}
+
+impl Event {
+    /// Whose transcript this belongs to, which for an event about a child is the parent
+    /// it is news for: a child's own stream is the child's, the line saying it started is
+    /// the parent's. `None` is the session itself, which belongs to everyone.
+    pub fn agent(&self) -> Option<Uuid> {
+        match self {
+            Event::SessionStart { .. } | Event::SessionEnd { .. } => None,
+            Event::AgentStart { parent, .. } | Event::AgentEnd { parent, .. } => Some(*parent),
+            Event::TurnStart { agent, .. }
+            | Event::UserMessage { agent, .. }
+            | Event::Notice { agent, .. }
+            | Event::ThinkingDelta { agent, .. }
+            | Event::MessageDelta { agent, .. }
+            | Event::CodeDelta { agent, .. }
+            | Event::ToolStart { agent, .. }
+            | Event::ToolStream { agent, .. }
+            | Event::ToolEnd { agent, .. }
+            | Event::Compaction { agent, .. }
+            | Event::TurnEnd { agent, .. }
+            | Event::Answer { agent, .. } => Some(*agent),
+        }
+    }
+}
+
+/// What the children have to say, as the model reads it. The wrapper is what keeps a
+/// turn nobody typed from reading like a person, live and replayed alike.
+pub fn news(text: &str) -> String {
+    format!("[your subagents, not the person you are talking to]\n{text}")
 }
 
 /// A way to stop a turn that is already running, held by whoever is not holding the
@@ -194,18 +250,38 @@ impl Agent {
     /// Rebuilds the model's context from the session log. The kernel namespace does not
     /// come back: variables from the earlier run are gone, which the system message says
     /// out loud so the transcript's own promises do not mislead the model.
+    ///
+    /// Only the root's own dialogue comes back. A root cannot be named outright — this
+    /// process minted a fresh id, and the log's `session_start` never carried one — so it
+    /// is whoever no `agent_start` ever announced. Read that way, a log that was resumed
+    /// and resumed again, with a generation of roots in it, still replays as one thread.
     pub fn replay(&mut self, events: impl IntoIterator<Item = Event>) {
         if let Some(system) = self.messages.first_mut()
             && let Some(prompt) = system.content.as_mut()
         {
             prompt.push_str(RESUMED);
         }
+        let events: Vec<Event> = events.into_iter().collect();
+        let children: std::collections::HashSet<Uuid> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::AgentStart { agent, .. } => Some(*agent),
+                _ => None,
+            })
+            .collect();
+
         let mut pending: Option<ToolCall> = None;
         let mut output = String::new();
         for event in events {
+            if event.agent().is_some_and(|agent| children.contains(&agent)) {
+                continue;
+            }
             match event {
                 Event::UserMessage { text, .. } => {
                     self.messages.push(Message::text(Role::User, text))
+                }
+                Event::Notice { text, .. } => {
+                    self.messages.push(Message::text(Role::User, news(&text)))
                 }
                 Event::Answer { text, .. } if !text.is_empty() => {
                     self.messages.push(Message::text(Role::Assistant, text))
@@ -249,16 +325,48 @@ impl Agent {
         prompt: &str,
         on_event: &mut (dyn FnMut(Event) + Send),
     ) -> Result<Outcome> {
+        self.turn(prompt, false, on_event).await
+    }
+
+    /// A turn started by what the children reported rather than by a person. It is the
+    /// same turn in every other way; only what the log records, and what the model is
+    /// told it is reading, differ.
+    pub async fn notified(
+        &mut self,
+        text: &str,
+        on_event: &mut (dyn FnMut(Event) + Send),
+    ) -> Result<Outcome> {
+        self.turn(text, true, on_event).await
+    }
+
+    async fn turn(
+        &mut self,
+        prompt: &str,
+        from_children: bool,
+        on_event: &mut (dyn FnMut(Event) + Send),
+    ) -> Result<Outcome> {
         let turn_id = Uuid::now_v7();
         on_event(Event::TurnStart {
             turn_id,
             agent: self.id,
         });
-        on_event(Event::UserMessage {
-            turn_id,
-            text: prompt.to_string(),
+        let said = match from_children {
+            true => news(prompt),
+            false => prompt.to_string(),
+        };
+        on_event(match from_children {
+            true => Event::Notice {
+                turn_id,
+                agent: self.id,
+                text: prompt.to_string(),
+            },
+            false => Event::UserMessage {
+                turn_id,
+                agent: self.id,
+                text: prompt.to_string(),
+            },
         });
-        self.messages.push(Message::text(Role::User, prompt));
+        self.messages.push(Message::text(Role::User, said));
 
         let started = Instant::now();
         let mut cancelled = self.cancel.subscribe();

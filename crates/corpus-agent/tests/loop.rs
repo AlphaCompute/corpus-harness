@@ -192,6 +192,7 @@ async fn a_resumed_transcript_does_not_promise_a_namespace_that_is_gone() {
 
     agent.replay([Event::UserMessage {
         turn_id: uuid::Uuid::nil(),
+        agent: uuid::Uuid::nil(),
         text: "Fetch the page into `page`.".into(),
     }]);
     ask(&mut agent, "What was in it?").await;
@@ -200,6 +201,69 @@ async fn a_resumed_transcript_does_not_promise_a_namespace_that_is_gone() {
     assert!(
         sent.contains("interpreter is fresh"),
         "a replayed session must say its variables did not come back: {sent}"
+    );
+}
+
+/// A log holds every agent's stream, and only one of them is the session. The root cannot
+/// be named outright — this process minted a fresh id — so it is whoever no `AgentStart`
+/// announced, and the child's dialogue must stay out of the context that comes back.
+#[tokio::test]
+async fn a_replayed_log_brings_back_the_root_and_not_its_children() {
+    let endpoint = serve(vec![says("Both, still.")]).await;
+    let mut agent = agent(&endpoint, Arc::new(Recorder::default()), Budget::default()).await;
+    let root = uuid::Uuid::now_v7();
+    let child = uuid::Uuid::now_v7();
+    let turn = uuid::Uuid::now_v7();
+
+    agent.replay([
+        Event::UserMessage {
+            turn_id: turn,
+            agent: root,
+            text: "Read both reports.".into(),
+        },
+        Event::AgentStart {
+            agent: child,
+            parent: root,
+            task: "Read the second report.".into(),
+        },
+        Event::UserMessage {
+            turn_id: uuid::Uuid::now_v7(),
+            agent: child,
+            text: "Read the second report.".into(),
+        },
+        Event::Answer {
+            agent: child,
+            text: "The second report says margins fell.".into(),
+        },
+        Event::AgentEnd {
+            agent: child,
+            parent: root,
+            ok: true,
+            chars: 36,
+            preview: "The second report says margins fell.".into(),
+        },
+        Event::Answer {
+            agent: root,
+            text: "Both are read.".into(),
+        },
+        Event::Notice {
+            turn_id: uuid::Uuid::now_v7(),
+            agent: root,
+            text: "an agent finished: 36 chars".into(),
+        },
+    ]);
+    ask(&mut agent, "What did they say?").await;
+
+    let sent = &endpoint.requests()[0];
+    assert!(sent.contains("Read both reports."), "{sent}");
+    assert!(sent.contains("Both are read."), "{sent}");
+    assert!(
+        !sent.contains("margins fell"),
+        "the child's own dialogue is not the session's: {sent}"
+    );
+    assert!(
+        sent.contains("an agent finished") && sent.contains("not the person"),
+        "a turn nobody typed must come back saying so: {sent}"
     );
 }
 

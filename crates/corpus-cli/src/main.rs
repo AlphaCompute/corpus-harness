@@ -283,6 +283,10 @@ pub struct Sink {
     /// Set once the turn has streamed any answer text, so the one the loop writes for
     /// itself when it gives up is printed rather than duplicating what already appeared.
     answered: bool,
+    /// Everyone some `AgentStart` announced. A child's stream is written to the log whole
+    /// and shown as the two lines that bracket it, because eight children streaming at
+    /// once is not something a reader can follow.
+    children: std::collections::HashSet<uuid::Uuid>,
 }
 
 impl Sink {
@@ -293,6 +297,7 @@ impl Sink {
             log,
             writing: false,
             answered: false,
+            children: std::collections::HashSet::new(),
         })
     }
 
@@ -301,6 +306,9 @@ impl Sink {
         // The replacement marker is inside the text, so the reader sees the fact of it.
         if let Event::Answer { text, .. } = &mut event {
             *text = host::scrub(text);
+        }
+        if let Event::AgentStart { agent, .. } = &event {
+            self.children.insert(*agent);
         }
 
         if let Some(log) = &self.log {
@@ -321,6 +329,9 @@ impl Sink {
     /// and something reading the output has no use for escape codes. The TUI is where
     /// colour belongs; the log is the machine-readable copy.
     fn draw(&mut self, event: &Event) {
+        if event.agent().is_some_and(|agent| self.children.contains(&agent)) {
+            return;
+        }
         match event {
             // Branding rather than output, so the mark keeps the brand's blue when a
             // person is reading and drops it when something else is.
@@ -340,6 +351,14 @@ impl Sink {
             Event::UserMessage { text, .. } => {
                 self.answered = false;
                 println!("\n› {text}");
+            }
+            Event::Notice { text, .. } => {
+                self.answered = false;
+                println!("\n· {text}");
+            }
+            Event::AgentStart { task, .. } => println!("\n· agent · {}", tui::one_line(task)),
+            Event::AgentEnd { ok, chars, .. } => {
+                println!("{} agent · {chars} chars", if *ok { "✓" } else { "✗" })
             }
             Event::MessageDelta { text, .. } => {
                 self.answered = true;

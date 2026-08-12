@@ -62,17 +62,28 @@ fn preview(code: &str) -> String {
     }
 }
 
+/// A task as one line of a transcript. Unlike a cell, what a child was asked is prose:
+/// there is no line in it worth picking out, only a beginning worth showing.
+pub fn one_line(text: &str) -> String {
+    let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match line.chars().count() > 64 {
+        true => ellipsize(&line, 63),
+        false => line,
+    }
+}
+
 fn ellipsize(text: &str, keep: usize) -> String {
     text.chars().take(keep).chain("…".chars()).collect()
 }
 
-/// One step of the transcript, running or finished. The preview is `FLEX_SPAN`, so a
-/// narrow terminal eats the glimpse of code and keeps the mark, the name and the tail.
-fn step(mark: &str, colour: Color, name: &str, code: &str, tail: String) -> Line<'static> {
+/// One step of the transcript, running or finished — a cell that ran or a child that was
+/// sent off. The glimpse of what it does is `FLEX_SPAN`, so a narrow terminal eats that
+/// and keeps the mark, the name and the tail.
+fn step(mark: &str, colour: Color, name: &str, glimpse: String, tail: String) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{mark} "), Style::new().fg(colour)),
         Span::styled(name.to_string(), Style::new().fg(ACCENT)),
-        Span::styled(format!(" · {}", preview(code)), Style::new()),
+        Span::styled(format!(" · {glimpse}"), Style::new()),
         Span::styled(tail, muted()),
     ])
 }
@@ -216,9 +227,19 @@ impl Transcript {
 
     /// Drops everything from `at` and puts one ready-made line in its place. `push_ready`
     /// touches what the truncate left behind, which is this same index.
+    ///
+    /// What a cell printed collapses into the line that replaces it; ready-made lines do
+    /// not, because they are not the cell's output. A child sent off mid-cell leaves one
+    /// of those, and it has to outlive the cell that sent it: otherwise the only word of
+    /// a child that runs for minutes disappears the moment its parent's cell ends.
     fn replace_line(&mut self, at: usize, line: Line<'static>, flex: bool) {
-        self.entries.truncate(at);
+        let kept: Vec<Entry> = self
+            .entries
+            .drain(at.min(self.entries.len())..)
+            .filter(|entry| matches!(entry, Entry::Ready { .. }))
+            .collect();
         self.push_ready(line, flex);
+        self.entries.extend(kept);
     }
 
     fn close(&mut self) {
@@ -356,6 +377,10 @@ struct App {
     /// A running cell shows its code and its output; once it is done all of that
     /// collapses into one line, the way a finished step reads in a transcript.
     tool: Option<RunningTool>,
+    /// What each child was asked, kept so the line saying it finished can say which one
+    /// finished. A child's own stream never reaches the screen: it is in the log, and
+    /// what a reader needs here is that one started and that one came back.
+    kids: std::collections::HashMap<uuid::Uuid, String>,
 }
 
 struct RunningTool {
@@ -384,6 +409,7 @@ impl App {
             answer_at: None,
             writing_at: None,
             tool: None,
+            kids: std::collections::HashMap::new(),
         };
         let brand = Style::new().fg(BRAND);
         app.transcript.push_ready(Line::styled(MARK[0], brand), false);
@@ -410,6 +436,15 @@ impl App {
     }
 
     fn on_event(&mut self, event: Event) {
+        // A child's deltas are the child's business: the parent's transcript carries the
+        // line that says one started and the line that says it came back, and the log
+        // keeps everything in between for whoever wants it.
+        if event
+            .agent()
+            .is_some_and(|agent| self.kids.contains_key(&agent))
+        {
+            return;
+        }
         match event {
             Event::SessionStart { model, .. } => self.model = model,
             Event::UserMessage { text, .. } => {
@@ -419,6 +454,40 @@ impl App {
                     0,
                     Style::new().bg(BAND).add_modifier(Modifier::BOLD),
                     format!("› {text}"),
+                );
+            }
+            // News from the children reads as the transcript's own voice, not as the
+            // person's: nobody typed it, and a band would say somebody did.
+            Event::Notice { text, .. } => {
+                self.answer_at = None;
+                self.transcript.blank();
+                self.transcript.line(0, muted(), format!("· {text}"));
+            }
+            Event::AgentStart { agent, task, .. } => {
+                self.answer_at = None;
+                self.transcript.blank();
+                self.transcript
+                    .push_ready(step("·", ACCENT, "agent", one_line(&task), String::new()), true);
+                self.kids.insert(agent, task);
+            }
+            Event::AgentEnd {
+                agent, ok, chars, ..
+            } => {
+                let task = self.kids.get(&agent).cloned().unwrap_or_default();
+                let (mark, colour) = match ok {
+                    true => ("✓", Color::Green),
+                    false => ("✗", Color::Red),
+                };
+                self.answer_at = None;
+                self.transcript.push_ready(
+                    step(
+                        mark,
+                        colour,
+                        "agent",
+                        one_line(&task),
+                        format!(" · {chars} chars"),
+                    ),
+                    true,
                 );
             }
             Event::ThinkingDelta { text, .. } => self.transcript.stream(2, thinking(), &text),
@@ -457,7 +526,7 @@ impl App {
                     "·",
                     ACCENT,
                     &name,
-                    &code,
+                    preview(&code),
                     format!(" · ↑ {} lines", code.lines().count()),
                 );
                 // The cell was watched as it was written, so the step takes that place
@@ -528,7 +597,7 @@ impl App {
             mark,
             colour,
             &tool.name,
-            &tool.code,
+            preview(&tool.code),
             format!(" · ↑ {sent}{back} lines · {}", took(ms)),
         );
         self.transcript.replace_line(tool.at, head, true);
@@ -898,6 +967,7 @@ mod tests {
             },
             Event::UserMessage {
                 turn_id: agent,
+                agent,
                 text: "say hi".into(),
             },
             Event::ToolStart {
@@ -948,6 +1018,7 @@ mod tests {
         let mut app = App::new();
         app.on_event(Event::UserMessage {
             turn_id: agent,
+            agent,
             text: "go".into(),
         });
         app.on_event(Event::MessageDelta {
@@ -1103,6 +1174,155 @@ mod tests {
         assert!(
             screen.contains("ZeroDivisionError: division by zero"),
             "{screen}"
+        );
+    }
+
+    /// A child is two lines in the parent's transcript and nothing else on screen: eight
+    /// of them streaming at once is not something a reader can follow, and the log keeps
+    /// every word of it anyway.
+    #[test]
+    fn a_child_is_two_lines_and_its_stream_stays_in_the_log() {
+        let root = Uuid::now_v7();
+        let child = Uuid::now_v7();
+        let mut app = App::new();
+        app.context = 4_000;
+        for event in [
+            Event::AgentStart {
+                agent: child,
+                parent: root,
+                task: "Read the second quarterly report and summarise it".into(),
+            },
+            Event::MessageDelta {
+                agent: child,
+                text: "margins fell".into(),
+            },
+            Event::ToolStart {
+                agent: child,
+                call_id: "c9".into(),
+                name: "python".into(),
+                args: json!({ "code": "print('child at work')" }),
+            },
+            Event::ToolEnd {
+                agent: child,
+                call_id: "c9".into(),
+                ok: true,
+                summary: "child at work".into(),
+                ms: 7,
+            },
+            Event::TurnEnd {
+                turn_id: child,
+                agent: child,
+                stop: StopReason::Stop,
+                usage: Usage::default(),
+                context: 190_000,
+            },
+            Event::AgentEnd {
+                agent: child,
+                parent: root,
+                ok: true,
+                chars: 4210,
+                preview: "margins fell".into(),
+            },
+        ] {
+            app.on_event(event);
+        }
+
+        let screen = screen(&mut app, 70, 16);
+        assert!(
+            screen.contains("· agent · Read the second quarterly report and summarise it"),
+            "the line saying a child was sent off: {screen}"
+        );
+        assert!(
+            screen.contains("✓ agent · Read the second quarterly report")
+                && screen.contains("4210 chars"),
+            "the line saying it came back: {screen}"
+        );
+        assert!(
+            !screen.contains("margins fell") && !screen.contains("child at work"),
+            "a child's own stream must stay off the parent's screen: {screen}"
+        );
+        assert_eq!(app.context, 4_000, "a child's context is not the session's");
+    }
+
+    /// The parent keeps writing while a child works, and a child's step must not be taken
+    /// for the parent's: the running cell it would fold is not the one it started.
+    #[test]
+    fn a_child_does_not_disturb_the_cell_the_parent_is_running() {
+        let root = Uuid::now_v7();
+        let child = Uuid::now_v7();
+        let mut app = App::new();
+        for event in [
+            Event::ToolStart {
+                agent: root,
+                call_id: "c1".into(),
+                name: "python".into(),
+                args: json!({ "code": "answers = [kid.result() for kid in agents()]" }),
+            },
+            Event::AgentStart {
+                agent: child,
+                parent: root,
+                task: "dig".into(),
+            },
+            Event::ToolStart {
+                agent: child,
+                call_id: "c2".into(),
+                name: "python".into(),
+                args: json!({ "code": "print('elsewhere')" }),
+            },
+            Event::ToolEnd {
+                agent: child,
+                call_id: "c2".into(),
+                ok: false,
+                summary: "NameError: elsewhere".into(),
+                ms: 3,
+            },
+            Event::ToolEnd {
+                agent: root,
+                call_id: "c1".into(),
+                ok: true,
+                summary: "3 answers".into(),
+                ms: 900,
+            },
+        ] {
+            app.on_event(event);
+        }
+
+        let screen = screen(&mut app, 70, 16);
+        assert!(
+            screen.contains("✓ python · answers = [kid.result() for kid in a"),
+            "the parent's own cell must be the one that folds: {screen}"
+        );
+        assert!(
+            !screen.contains("NameError"),
+            "a child's failure unfolded into the parent's transcript: {screen}"
+        );
+        assert!(
+            screen.contains("· agent · dig"),
+            "a child sent off mid-cell must outlive the cell that sent it: {screen}"
+        );
+    }
+
+    /// News from the children is not a question a person asked, and the band is how the
+    /// transcript says who is talking.
+    #[test]
+    fn news_from_the_children_does_not_read_as_a_person() {
+        let root = Uuid::now_v7();
+        let mut app = App::new();
+        app.on_event(Event::Notice {
+            turn_id: root,
+            agent: root,
+            text: "an agent finished · 4210 chars".into(),
+        });
+
+        let rendered = buffer(&mut app, 40, 12);
+        assert_ne!(
+            rendered[(2, LOCKUP + 1)].style().bg,
+            Some(BAND),
+            "only a person's own question gets the band"
+        );
+        assert!(
+            screen(&mut app, 40, 12).contains("· an agent finished"),
+            "the news itself belongs on screen"
         );
     }
 
@@ -1272,6 +1492,7 @@ mod tests {
         let mut app = App::new();
         app.on_event(Event::UserMessage {
             turn_id: agent,
+            agent,
             text: "hi".into(),
         });
 
@@ -1376,6 +1597,7 @@ mod tests {
         let mut app = App::new();
         app.on_event(Event::UserMessage {
             turn_id: agent,
+            agent,
             text: "71*93?".into(),
         });
         app.on_event(Event::MessageDelta {
@@ -1461,6 +1683,7 @@ mod tests {
         for event in [
             Event::UserMessage {
                 turn_id: agent,
+                agent,
                 text: "go".into(),
             },
             Event::ThinkingDelta {
