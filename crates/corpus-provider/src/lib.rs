@@ -211,6 +211,64 @@ pub struct Completion {
     pub usage: Usage,
 }
 
+/// The names an OpenAI-compatible listing gives the context window. Every gateway spells
+/// it differently and some nest it under `limit`; only OpenAI itself states nothing at
+/// all, and a model that names none reports zero.
+const WINDOW_KEYS: [&str; 5] = [
+    "context_window",
+    "contextWindow",
+    "context_length",
+    "max_model_len",
+    "max_context_length",
+];
+
+/// Windows for weights whose gateway publishes none, under the names the weights are
+/// released as. Deliberately short: a wrong number reads as certainty and throws the
+/// readout off, so anything not matched here shows no share at all. The nemotron figure
+/// is what a gateway serving it enforces as `max_model_len`, which is also what NVIDIA
+/// states for BF16; the same weights reach 1M under NVFP4 on Blackwell.
+const KNOWN_WINDOWS: [(&str, u32); 2] = [
+    ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", 262_144),
+    ("x-ai/grok-2", 131_072),
+];
+
+/// The window a gateway's own name for a model implies. Gateways rename what they serve,
+/// so `nemotron-3-ultra` has to find the weights it is a nickname for: a name matches
+/// when its words appear in order inside a released name. Several may match, because a
+/// short nickname can sit inside a whole family — the window is only borrowed when every
+/// match agrees on it, since a share against the wrong model is worse than no share.
+fn known_window(id: &str) -> u32 {
+    let words = |name: &str| -> Vec<String> {
+        name.split(|letter: char| !letter.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    };
+    let alias = words(id);
+    // One word names a family rather than a checkpoint, and families do not share a
+    // window: `grok` would otherwise borrow whatever grok-2 happens to take.
+    if alias.len() < 2 {
+        return 0;
+    }
+    let mut matched = KNOWN_WINDOWS
+        .iter()
+        .filter(|(known, _)| words(known).windows(alias.len()).any(|run| run == alias))
+        .map(|(_, window)| *window);
+    let first = matched.next().unwrap_or(0);
+    match matched.all(|window| window == first) {
+        true => first,
+        false => 0,
+    }
+}
+
+/// One entry of the provider's model listing.
+#[derive(Debug, Clone)]
+pub struct Model {
+    pub id: String,
+    /// Tokens the model takes at once, or 0 when the provider does not say.
+    pub window: u32,
+}
+
 pub struct Provider {
     http: reqwest::Client,
     base_url: String,
@@ -245,7 +303,7 @@ impl Provider {
     }
 
     /// What this provider offers, in the order it lists them.
-    pub async fn models(&self) -> Result<Vec<String>> {
+    pub async fn models(&self) -> Result<Vec<Model>> {
         let response = self
             .http
             .get(format!("{}/models", self.base_url))
@@ -264,7 +322,18 @@ impl Provider {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|model| model["id"].as_str().map(String::from))
+            .filter_map(|model| {
+                let id = model["id"].as_str()?.to_string();
+                let stated = WINDOW_KEYS
+                    .iter()
+                    .find_map(|key| model[key].as_u64())
+                    .or_else(|| model["limit"]["context"].as_u64());
+                let window = match stated {
+                    Some(tokens) => tokens as u32,
+                    None => known_window(&id),
+                };
+                Some(Model { id, window })
+            })
             .collect())
     }
 
@@ -705,5 +774,27 @@ impl Acc {
             stop,
             usage: self.usage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_gateways_own_name_for_a_model_finds_the_weights_it_serves() {
+        assert_eq!(known_window("nemotron-3-ultra"), 262_144);
+        assert_eq!(
+            known_window("NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"),
+            262_144
+        );
+        assert_eq!(known_window("grok-2"), 131_072);
+        // A nickname that sits inside a longer released name still finds it, because
+        // every match agrees on the window.
+        assert_eq!(known_window("nemotron-3"), 262_144);
+        // Weights nobody here has a figure for stay unknown rather than guessed.
+        assert_eq!(known_window("gpt-4o"), 0);
+        assert_eq!(known_window("grok"), 0);
+        assert_eq!(known_window(""), 0);
     }
 }

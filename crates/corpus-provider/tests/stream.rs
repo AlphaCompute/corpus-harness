@@ -203,12 +203,39 @@ async fn a_rejected_request_reports_what_the_provider_said() {
 #[tokio::test]
 async fn the_model_list_comes_back_in_the_order_the_provider_gave_it() {
     let endpoint = corpus_testkit::serve(vec![corpus_testkit::json(
-        r#"{"object":"list","data":[{"id":"grok-2"},{"id":"nemotron-3"}]}"#,
+        r#"{"object":"list","data":[
+            {"id":"grok-2","context_length":131072},
+            {"id":"nemotron-3","max_model_len":8192},
+            {"id":"kimi-k3","context_window":262144},
+            {"id":"glm-5","limit":{"context":204800,"output":131072}},
+            {"id":"nemotron-3-ultra"},
+            {"id":"gpt-4o"}
+        ]}"#,
     )])
     .await;
     let provider = Provider::new(&endpoint.url, "test-key", "");
 
-    assert_eq!(provider.models().await.unwrap(), ["grok-2", "nemotron-3"]);
+    let listed: Vec<(String, u32)> = provider
+        .models()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|model| (model.id, model.window))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("grok-2".to_string(), 131072),
+            ("nemotron-3".to_string(), 8192),
+            // Every gateway spells the window its own way, and some nest it.
+            ("kimi-k3".to_string(), 262144),
+            ("glm-5".to_string(), 204800),
+            // A gateway that publishes nothing but serves a model we know the spec of.
+            ("nemotron-3-ultra".to_string(), 262144),
+            // Anything else stays at zero rather than guessed.
+            ("gpt-4o".to_string(), 0),
+        ]
+    );
 }
 
 #[tokio::test]

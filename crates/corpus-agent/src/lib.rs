@@ -67,6 +67,11 @@ pub enum Event {
         agent: Uuid,
         stop: StopReason,
         usage: Usage,
+        /// What the last step of the turn sent, which is what the session is carrying
+        /// now. `usage.input` is the turn's whole bill and counts a long turn's context
+        /// once per step, so it says nothing about how full the window is.
+        #[serde(default)]
+        context: u32,
     },
     Answer {
         agent: Uuid,
@@ -263,6 +268,7 @@ impl Agent {
         let started = Instant::now();
         let mut cancelled = self.cancel.watch();
         let mut usage = Usage::default();
+        let mut context = 0;
         let mut answer = String::new();
         let mut steps = 0;
 
@@ -309,6 +315,7 @@ impl Agent {
             };
             usage.input += completion.usage.input;
             usage.output += completion.usage.output;
+            context = completion.usage.input;
 
             if completion.tool_calls.is_empty() {
                 // Text is the answer only when the model asked for nothing else (§6).
@@ -345,6 +352,7 @@ impl Agent {
             agent: self.id,
             stop,
             usage,
+            context,
         });
         Ok(Outcome {
             text: answer,

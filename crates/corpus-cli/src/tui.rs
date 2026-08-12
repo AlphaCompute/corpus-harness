@@ -4,22 +4,23 @@ use anyhow::Result;
 use corpus_agent::Event;
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event as Term, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc;
 
-use crate::Sink;
 use crate::session::Session;
+use crate::{MARK, Opening, Sink, WORDMARK};
 
 const ACCENT: Color = Color::Cyan;
 const BRAND: Color = Color::Rgb(0x00, 0x00, 0xFF);
 const MUTED: Color = Color::DarkGray;
 /// Assumes a dark terminal, which is the only thing a single constant can assume.
 const BAND: Color = Color::Indexed(236);
-/// The one row above the transcript.
-const HEAD: u16 = 1;
+/// Past this share of the window, how much room is left stops being trivia.
+const TIGHT: f32 = 0.75;
+const FULL: f32 = 0.9;
 /// Which span of a ready-made line gives way when the terminal is too narrow: what the
 /// cell did and how long it took must survive, so it is the glimpse of code that goes.
 const FLEX_SPAN: usize = 2;
@@ -74,6 +75,15 @@ fn step(mark: &str, colour: Color, name: &str, code: &str, tail: String) -> Line
         Span::styled(format!(" · {}", preview(code)), Style::new()),
         Span::styled(tail, muted()),
     ])
+}
+
+/// Round token counts the way a reader says them out loud.
+fn tokens(count: u32) -> String {
+    match count {
+        0..1_000 => count.to_string(),
+        1_000..100_000 => format!("{:.1}k", count as f32 / 1000.0),
+        _ => format!("{}k", count / 1000),
+    }
 }
 
 fn took(ms: u64) -> String {
@@ -289,6 +299,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 enum Msg {
     Event(Event),
+    Window(u32),
     TurnDone,
     Failed(String),
 }
@@ -302,6 +313,10 @@ enum Action {
 
 struct App {
     model: String,
+    /// Tokens the last turn sent, and how many the model takes at once. A window of zero
+    /// is a provider that never said, and then only the count is worth showing.
+    context: u32,
+    window: u32,
     transcript: Transcript,
     input: Vec<char>,
     cursor: usize,
@@ -329,9 +344,13 @@ struct RunningTool {
 }
 
 impl App {
+    /// The lockup belongs to opening the window, not to the session: it is on screen
+    /// before the first prompt is typed.
     fn new() -> App {
-        App {
+        let mut app = App {
             model: String::new(),
+            context: 0,
+            window: 0,
             transcript: Transcript::default(),
             input: Vec::new(),
             cursor: 0,
@@ -344,7 +363,19 @@ impl App {
             answer_at: None,
             writing_at: None,
             tool: None,
-        }
+        };
+        let brand = Style::new().fg(BRAND);
+        app.transcript.push_ready(Line::styled(MARK[0], brand));
+        app.transcript.push_ready(Line::from(vec![
+            Span::styled(MARK[1], brand),
+            Span::raw(format!("  corpus v{}", env!("CARGO_PKG_VERSION"))),
+        ]));
+        app.transcript.push_ready(Line::from(vec![
+            Span::styled(MARK[2], brand),
+            Span::raw("  by "),
+            Span::styled(WORDMARK, Style::new().add_modifier(Modifier::BOLD)),
+        ]));
+        app
     }
 
     fn busy(&self) -> bool {
@@ -442,15 +473,11 @@ impl App {
                 self.transcript
                     .line(0, muted(), format!("· compacted {dropped} tool results"))
             }
-            Event::TurnEnd { stop, usage, .. } => {
+            Event::TurnEnd { context, .. } => {
                 // A turn stopped mid-cell keeps the code it had written on screen, but
                 // the place it was going to stays behind with it.
                 self.writing_at = None;
-                self.transcript.line(
-                    0,
-                    muted(),
-                    format!("· {stop:?} · {} in / {} out", usage.input, usage.output),
-                );
+                self.context = context;
             }
             _ => {}
         }
@@ -561,35 +588,35 @@ impl App {
         self.follow = false;
     }
 
-    /// One row: who this is, which model, and how far the view is from the end.
-    fn header(&self, frame: &mut Frame, head: Rect, bottom: usize) {
-        let mut spans = vec![Span::styled("corpus", Style::new().fg(BRAND))];
-        if !self.model.is_empty() {
-            spans.push(Span::styled(format!(" · {}", self.model), muted()));
+    /// How much of the window the session is carrying. A known window is worth showing
+    /// from the start, empty; an unknown one has nothing to say until a turn has come
+    /// back with a count, and then only the count.
+    fn fill(&self) -> Line<'static> {
+        if self.context == 0 && self.window == 0 {
+            return Line::default();
         }
-        spans.push(Span::styled(
-            format!(" · v{}", env!("CARGO_PKG_VERSION")),
-            muted(),
-        ));
-        frame.render_widget(Paragraph::new(Line::from(spans)), head);
-
-        // Styling the paragraph would paint its whole rect, and this sits on top of the
-        // header: the style belongs to the words, not to the row they land on.
-        if self.offset < bottom {
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    format!(" ↓ {} more ", bottom - self.offset),
-                    muted(),
-                ))
-                .right_aligned(),
-                head,
-            );
+        let mut spans = vec![Span::styled(format!("{} ", tokens(self.context)), muted())];
+        if self.window > 0 {
+            let share = self.context as f32 / self.window as f32;
+            let colour = match share {
+                _ if share >= FULL => Color::Red,
+                _ if share >= TIGHT => Color::Yellow,
+                _ => MUTED,
+            };
+            spans.push(Span::styled(
+                format!("/ {} · ", tokens(self.window)),
+                muted(),
+            ));
+            spans.push(Span::styled(
+                format!("{:.0}% ", share * 100.0),
+                Style::new().fg(colour),
+            ));
         }
+        Line::from(spans)
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [head, body, status, prompt] = Layout::vertical([
-            Constraint::Length(HEAD),
+        let [body, prompt, status] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -625,23 +652,15 @@ impl App {
         }
         frame.render_widget(Paragraph::new(view), body);
 
-        self.header(frame, head, bottom);
-
-        let hints = match self.busy() {
-            true => " enter send · ↑↓ scroll · ^C interrupt",
-            false => " enter send · ↑↓ scroll · ^C quit",
+        let mut left = match self.model.is_empty() {
+            true => String::new(),
+            false => format!(" {}", self.model),
         };
-        frame.render_widget(Paragraph::new(Line::styled(hints, muted())), status);
         if !self.queued.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    format!("{} queued ", self.queued.len()),
-                    muted(),
-                ))
-                .right_aligned(),
-                status,
-            );
+            left.push_str(&format!(" · {} queued", self.queued.len()));
         }
+        frame.render_widget(Paragraph::new(Line::styled(left, muted())), status);
+        frame.render_widget(Paragraph::new(self.fill()).right_aligned(), status);
 
         // The input is one line: long text scrolls sideways rather than growing the box.
         let room = prompt.width.saturating_sub(3) as usize;
@@ -661,9 +680,18 @@ impl App {
     }
 }
 
-pub async fn run(session: Box<dyn Session>, sink: Sink) -> Result<()> {
+pub async fn run(session: Box<dyn Session>, sink: Sink, opening: Opening) -> Result<()> {
     let (prompt_tx, prompt_rx) = mpsc::channel::<String>(8);
     let (msg_tx, mut msgs) = mpsc::unbounded_channel::<Msg>();
+
+    // Whoever can name the window is still being asked; the screen opens without it.
+    let Opening { model, window } = opening;
+    let asked = msg_tx.clone();
+    tokio::spawn(async move {
+        if let Ok(tokens) = window.await {
+            let _ = asked.send(Msg::Window(tokens));
+        }
+    });
 
     let interrupt = session.interrupt();
     drive(session, sink, prompt_rx, msg_tx);
@@ -681,6 +709,7 @@ pub async fn run(session: Box<dyn Session>, sink: Sink) -> Result<()> {
     });
 
     let mut app = App::new();
+    app.model = model;
     let mut pulse = tokio::time::interval(Duration::from_millis(PULSE_MS));
 
     let outcome = loop {
@@ -694,6 +723,7 @@ pub async fn run(session: Box<dyn Session>, sink: Sink) -> Result<()> {
                 while let Some(current) = message.take() {
                     match current {
                         Msg::Event(event) => app.on_event(event),
+                        Msg::Window(tokens) => app.window = tokens,
                         Msg::TurnDone => {
                             app.working = None;
                             if !app.queued.is_empty() {
@@ -763,6 +793,7 @@ fn drive(
 
 #[cfg(test)]
 mod tests {
+    use corpus_provider::{StopReason, Usage};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyEvent;
@@ -793,10 +824,14 @@ mod tests {
             .join("\n")
     }
 
-    /// Screen row of a transcript line: crossterm counts from zero, and the header takes
-    /// the row above.
-    fn line_row(line: u16) -> u16 {
-        HEAD + line
+    /// How many transcript lines the lockup takes before anything a turn writes.
+    const LOCKUP: u16 = 3;
+
+    /// The row under the prompt, as a reader sees it: the outer padding is trimmed but
+    /// the gap that separates the two ends of the row is not.
+    fn status(app: &mut App) -> String {
+        let screen = screen(app, 60, 12);
+        screen.lines().next_back().unwrap().trim().to_string()
     }
 
     fn press(app: &mut App, code: KeyCode) -> Action {
@@ -862,7 +897,13 @@ mod tests {
         }
 
         let screen = screen(&mut app, 70, 16);
-        assert!(screen.starts_with("corpus · test-model"), "{screen}");
+        assert!(
+            screen.starts_with(&format!(
+                "  \\|/\n  -*-  corpus v{}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{screen}"
+        );
         assert!(screen.contains("› say hi"), "{screen}");
         assert!(
             screen.contains("✓ python · print('hi') · ↑ 1 ↓ 1 lines · 12ms"),
@@ -896,10 +937,6 @@ mod tests {
         assert!(
             rows[message + 1].contains("python ·"),
             "it belongs right after the message: {rows:#?}"
-        );
-        assert!(
-            rows[rows.len() - 2].contains("^C interrupt"),
-            "the bottom row is hints now"
         );
     }
 
@@ -1039,37 +1076,106 @@ mod tests {
         );
     }
 
-    /// Anything drawn on top of the header must not repaint the row it lands on.
+    /// The row above the prompt: which model answers, and how full its window is.
     #[test]
-    fn the_header_keeps_its_colour_under_what_is_written_over_it() {
+    fn the_status_row_names_the_model_and_how_full_the_window_is() {
+        let agent = Uuid::now_v7();
+        let mut app = App::new();
+        let end = |context| Event::TurnEnd {
+            turn_id: agent,
+            agent,
+            stop: StopReason::Stop,
+            usage: Usage {
+                input: 99_999,
+                output: 12,
+            },
+            context,
+        };
+
+        // The model is on screen from the moment the window opens, because the session
+        // says nothing about itself until a turn is under way.
+        app.model = "nemotron-3".into();
+        assert_eq!(
+            status(&mut app),
+            "nemotron-3",
+            "an unanswered window leaves nothing to report"
+        );
+
+        app.on_event(end(12_400));
+        let row = status(&mut app);
+        assert!(row.starts_with("nemotron-3"), "{row}");
+        assert!(
+            row.ends_with("12.4k") && !row.contains('%'),
+            "the count stands alone until the provider has answered for the window: {row}"
+        );
+
+        // Asking for the window runs behind the session rather than ahead of it, so the
+        // share appears mid-conversation, against what is already on screen.
+        app.window = 200_000;
+        let row = status(&mut app);
+        assert!(row.ends_with("12.4k / 200k · 6%"), "{row}");
+
+        // The turn's whole bill counts a long turn's context once per step, so the row
+        // must read the last step instead of `usage.input`.
+        app.on_event(end(184_000));
+        assert!(status(&mut app).ends_with("184k / 200k · 92%"), "{row}");
+    }
+
+    /// A window known before the first prompt is worth showing empty, so the row is not
+    /// blank for the whole of the first turn.
+    #[test]
+    fn a_known_window_shows_before_anything_has_been_asked() {
+        let mut app = App::new();
+        app.model = "nemotron-3".into();
+        app.window = 200_000;
+
+        let row = status(&mut app);
+        assert!(row.starts_with("nemotron-3"), "{row}");
+        assert!(row.ends_with("0 / 200k · 0%"), "{row}");
+    }
+
+    /// A provider that never said how big the window is gets no invented percentage.
+    #[test]
+    fn an_unknown_window_leaves_the_count_to_speak_for_itself() {
         let agent = Uuid::now_v7();
         let mut app = App::new();
         app.on_event(Event::SessionStart {
             session_id: agent,
-            model: "nemotron-3".into(),
+            model: "gpt-4o".into(),
         });
-        for n in 0..40 {
-            app.on_event(Event::MessageDelta {
-                agent,
-                text: format!("line {n}\n"),
-            });
-        }
-        app.scroll(-20);
+        app.on_event(Event::TurnEnd {
+            turn_id: agent,
+            agent,
+            stop: StopReason::Stop,
+            usage: Usage::default(),
+            context: 900,
+        });
 
-        let rendered = buffer(&mut app, 60, 12);
-        assert_eq!(rendered[(0, 0)].style().fg, Some(BRAND), "the name");
+        let row = status(&mut app);
+        assert!(row.starts_with("gpt-4o") && row.ends_with("900"), "{row}");
+        assert!(!row.contains('%'), "no window, no share: {row}");
+    }
+
+    /// The mark opens the window, whole and in the brand, before anything is typed.
+    #[test]
+    fn the_window_opens_under_the_mark() {
+        let mut app = App::new();
+
+        let screen = screen(&mut app, 60, 12);
+        let rows: Vec<&str> = screen.lines().take(3).collect();
         assert_eq!(
-            rendered[(10, 0)].style().fg,
-            Some(MUTED),
-            "the model beside it"
+            rows,
+            [
+                "  \\|/",
+                &format!("  -*-  corpus v{}", env!("CARGO_PKG_VERSION")),
+                "  /|\\  by ALPHA COMPUTE"
+            ],
+            "{screen}"
         );
-        assert!(
-            screen(&mut app, 60, 12)
-                .lines()
-                .next()
-                .unwrap()
-                .contains("↓"),
-            "and how far from the end it is"
+        assert_eq!(
+            buffer(&mut app, 60, 12)[(3, 1)].style().fg,
+            Some(BRAND),
+            "the star of the mark"
         );
     }
 
@@ -1083,7 +1189,7 @@ mod tests {
         });
 
         let rendered = buffer(&mut app, 40, 12);
-        let row = line_row(1);
+        let row = LOCKUP + 1;
         assert_eq!(
             rendered[(2, row)].style().bg,
             Some(BAND),
@@ -1164,8 +1270,8 @@ mod tests {
         });
 
         let rendered = buffer(&mut app, 40, 12);
-        let thought = rendered[(3, line_row(0))].style();
-        let answer = rendered[(3, line_row(1))].style();
+        let thought = rendered[(3, LOCKUP)].style();
+        let answer = rendered[(3, LOCKUP + 1)].style();
         assert!(
             thought.add_modifier.contains(Modifier::ITALIC),
             "{thought:?}"
@@ -1280,7 +1386,6 @@ mod tests {
 
         app.busy_with("python");
         assert!(matches!(app.on_key(ctrl_c), Action::Interrupt));
-        assert!(screen(&mut app, 60, 12).contains("^C interrupt"));
     }
 
     #[test]

@@ -31,11 +31,28 @@ pub async fn serve(responses: Vec<Vec<u8>>) -> Endpoint {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorder = seen.clone();
     tokio::spawn(async move {
-        for response in responses {
+        let mut responses = responses.into_iter().peekable();
+        loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
-            let body = drain_request(&mut socket).await;
+            let (head, body) = drain_request(&mut socket).await;
+            // A real provider answers its model listing whether or not anyone scripted
+            // one, and callers ask for it to learn the context window. A script that
+            // opens with a listing means the listing itself is what is under test.
+            let scripted_listing = responses
+                .peek()
+                .is_some_and(|next| String::from_utf8_lossy(next).contains(r#""object":"list""#));
+            if head.starts_with("GET /models") && !scripted_listing {
+                let _ = socket
+                    .write_all(&json(r#"{"object":"list","data":[]}"#))
+                    .await;
+                let _ = socket.flush().await;
+                continue;
+            }
+            let Some(response) = responses.next() else {
+                return;
+            };
             recorder.lock().unwrap().push(body);
             if response.is_empty() {
                 // An empty response means: take the request and never answer it.
@@ -52,12 +69,13 @@ pub async fn serve(responses: Vec<Vec<u8>>) -> Endpoint {
     }
 }
 
-async fn drain_request(socket: &mut TcpStream) -> String {
+/// The request line and headers, then the body it announced.
+async fn drain_request(socket: &mut TcpStream) -> (String, String) {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
         if socket.read_exact(&mut byte).await.is_err() {
-            return String::new();
+            return (String::new(), String::new());
         }
         head.push(byte[0]);
     }
@@ -70,7 +88,10 @@ async fn drain_request(socket: &mut TcpStream) -> String {
         .unwrap_or(0);
     let mut body = vec![0u8; length];
     let _ = socket.read_exact(&mut body).await;
-    String::from_utf8_lossy(&body).into_owned()
+    (
+        String::from_utf8_lossy(&head).into_owned(),
+        String::from_utf8_lossy(&body).into_owned(),
+    )
 }
 
 fn http(status: &str, content_type: &str, body: &str) -> Vec<u8> {
