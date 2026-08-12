@@ -574,6 +574,9 @@ impl App {
                 // the place it was going to stays behind with it.
                 self.writing_at = None;
                 self.context = context;
+                // A turn this side did not start ends here and nowhere else: the driver
+                // only reports the ones it ran, and a served session runs its own.
+                self.working = None;
             }
             _ => {}
         }

@@ -413,8 +413,10 @@ impl Sink {
                 println!("\n· {text}");
             }
             Event::AgentStart { task, .. } => println!("\n· agent · {}", tui::one_line(task)),
+            // Off a line of its own, like the line that sent the agent off: this lands
+            // whenever the agent comes back, which is as likely as not mid-sentence.
             Event::AgentEnd { ok, chars, .. } => {
-                println!("{} agent · {chars} chars", if *ok { "✓" } else { "✗" })
+                println!("\n{} agent · {chars} chars", if *ok { "✓" } else { "✗" })
             }
             Event::MessageDelta { text, .. } => {
                 self.answered = true;
@@ -606,18 +608,22 @@ async fn serve() -> Result<()> {
     });
 
     let mut leaving = false;
+    let mut waiting: Option<String> = None;
     while !leaving {
         let mut record = |event| {
             sink.emit(event);
         };
-        let next = tokio::select! {
-            command = commands.recv() => match command {
-                None | Some(Wire::Exit) => break,
-                Some(Wire::Interrupt) => None,
-                Some(Wire::Run { text }) => Some(Prompt::Human(text)),
+        let next = match waiting.take() {
+            Some(text) => Some(Prompt::Human(text)),
+            None => tokio::select! {
+                command = commands.recv() => match command {
+                    None | Some(Wire::Exit) => break,
+                    Some(Wire::Interrupt) => None,
+                    Some(Wire::Run { text }) => Some(Prompt::Human(text)),
+                },
+                // A served session is a session: its children report to it, not down the pipe.
+                news = session.idle(&mut record) => news?.map(Prompt::Notice),
             },
-            // A served session is a session: its children report to it, not down the pipe.
-            news = session.idle(&mut record) => news?.map(Prompt::Notice),
         };
         let Some(prompt) = next else { continue };
         let turn = deliver(&mut session, prompt, &mut record);
@@ -630,9 +636,11 @@ async fn serve() -> Result<()> {
                 result = &mut turn => break result,
                 Some(command) = commands.recv() => match command {
                     Wire::Interrupt => interrupt.raise(),
-                    // `connect` reads a turn to its end before sending another,
-                    // so a run arriving here is a client bug, not a queue.
-                    Wire::Run { .. } => {}
+                    // A client reads a turn to its end before sending another, but the
+                    // turn under way may be one this session started for itself, which
+                    // the client never saw begin. Dropping it would lose a person's
+                    // words to a turn they had no way of knowing about.
+                    Wire::Run { text } => waiting = Some(text),
                     Wire::Exit => {
                         leaving = true;
                         interrupt.raise();

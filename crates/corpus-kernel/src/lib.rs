@@ -234,13 +234,10 @@ impl Kernel {
                     continue;
                 }
                 Some(served) = calls.join_next() => {
-                    let (mine, reply) = served.context("a host call panicked")?;
-                    self.send(&reply)?;
-                    if mine {
-                        open -= 1;
-                        if open == 0 && !interrupted {
-                            deadline = Instant::now() + timeout;
-                        }
+                    self.send(&served.context("a host call panicked")?)?;
+                    open -= 1;
+                    if open == 0 && !interrupted {
+                        deadline = Instant::now() + timeout;
                     }
                     continue;
                 }
@@ -261,19 +258,33 @@ impl Kernel {
                     // requests are still answered — but only the running cell's own calls
                     // may buy it more clock.
                     let mine = cell == id;
-                    open += usize::from(mine);
                     let host = host.clone();
-                    calls.spawn(async move {
-                        let reply = match host.call(&func, args).await {
+                    let serve = async move {
+                        match host.call(&func, args).await {
                             Ok(value) => {
                                 json!({ "type": "host_reply", "req_id": req_id, "ok": true, "value": value })
                             }
                             Err(error) => {
                                 json!({ "type": "host_reply", "req_id": req_id, "ok": false, "error": error })
                             }
-                        };
-                        (mine, reply)
-                    });
+                        }
+                    };
+                    match mine {
+                        true => {
+                            open += 1;
+                            calls.spawn(serve);
+                        }
+                        // Not the cell's, so not the cell's to abandon: a thread waiting
+                        // on this has no interrupt that can reach it, and an answer that
+                        // never comes parks it for as long as the kernel lives. It writes
+                        // its own reply, because this loop will not be here for it.
+                        false => {
+                            let writes = self.writes.clone();
+                            tokio::spawn(async move {
+                                let _ = writes.send(encode(&serve.await));
+                            });
+                        }
+                    }
                 }
                 Frame::Done {
                     id: cell,

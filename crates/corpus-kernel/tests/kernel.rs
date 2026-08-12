@@ -232,6 +232,38 @@ async fn calls_in_flight_together_are_served_together() {
     assert_eq!(out, "2 paired\n");
 }
 
+/// A thread outlives the cell that started it, and so must the answer it is waiting on:
+/// nothing can interrupt a thread parked in a host call, so an answer that never comes
+/// parks it for as long as the kernel lives.
+#[tokio::test]
+async fn an_answer_a_thread_is_waiting_on_outlives_the_cell_that_ended() {
+    let mut kernel = start().await;
+    let mut out = String::new();
+    let outcome = kernel
+        .exec(
+            "import threading\n\
+             answers = []\n\
+             threading.Thread(target=lambda: answers.append(fetch_url(url='late')), daemon=True).start()",
+            &host(Slow(Duration::from_millis(300))),
+            &mut |text| out.push_str(text),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert!(outcome.ok, "{}", outcome.traceback);
+
+    let (after, _) = run(
+        &mut kernel,
+        "import time\n\
+         for _ in range(100):\n\
+        \x20   if answers: break\n\
+        \x20   time.sleep(0.05)\n\
+         len(answers)",
+    )
+    .await;
+    assert_eq!(after.repr, "1", "the thread was left waiting on nobody");
+}
+
 /// Interrupting a cell mid-call is an ordinary gesture, so what it leaves behind is worth
 /// counting: the kernel keeps going, and the slot the call was waiting on is gone.
 #[tokio::test]
