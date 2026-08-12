@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -82,9 +82,13 @@ impl Interrupter {
     }
 }
 
-/// A frame as it goes on the wire: one JSON object, one line.
-fn encode(frame: &Value) -> String {
-    format!("{frame}\n")
+/// A frame as it goes on the wire: one JSON object, one line. Everything written through
+/// [`line_writer`] is framed here, whichever pipe it is headed down.
+pub fn encode<T: Serialize>(frame: &T) -> String {
+    format!(
+        "{}\n",
+        serde_json::to_string(frame).expect("a frame is plain data")
+    )
 }
 
 fn interrupt() -> Value {

@@ -2,7 +2,6 @@ mod host;
 mod session;
 mod tui;
 
-use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use corpus_agent::{Agent, Budget, Event};
 use corpus_kernel::Kernel;
-use corpus_provider::{Provider, stamped};
+use corpus_provider::{Jsonl, Provider};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::host::Tools;
@@ -131,8 +130,23 @@ struct Config {
     model: Option<String>,
     python: Option<String>,
     kernel_dir: PathBuf,
-    /// Where to record the wire, when something needs reporting to whoever runs the model.
-    trace: Option<PathBuf>,
+    /// Where the wire is recorded, when something needs reporting to whoever runs the
+    /// model. Opened once and shared, so every provider built below writes to it.
+    trace: Option<Arc<Jsonl>>,
+    /// Tokens the model takes at once. The listing is the only place an OpenAI-compatible
+    /// provider states this and it costs a request to ask, so naming it outright skips one.
+    window: Option<u32>,
+    max_steps: Option<u32>,
+}
+
+/// A variable that is both set and not empty: an empty one is how a shell spells "unset",
+/// and every one of these means "fall back" rather than "use the empty string".
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
+    env(name)?.parse().ok()
 }
 
 /// Reads `.env` from the working directory. Runs before anything is spawned, which is
@@ -157,29 +171,40 @@ fn load_env_file() {
 }
 
 impl Config {
-    fn from_env() -> Config {
-        let var =
-            |name: &str, fallback: &str| std::env::var(name).unwrap_or_else(|_| fallback.into());
-        Config {
-            base_url: var("CORPUS_BASE_URL", "https://api.openai.com/v1"),
-            api_key: std::env::var("CORPUS_API_KEY")
-                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+    fn from_env() -> Result<Config> {
+        let trace = match env("CORPUS_TRACE").map(PathBuf::from) {
+            Some(path) => {
+                eprintln!("wire trace: {}", path.display());
+                Some(Arc::new(Jsonl::to(&path)?))
+            }
+            None => None,
+        };
+        Ok(Config {
+            base_url: env("CORPUS_BASE_URL")
+                .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+            api_key: env("CORPUS_API_KEY")
+                .or_else(|| env("OPENAI_API_KEY"))
                 .unwrap_or_default(),
-            model: std::env::var("CORPUS_MODEL")
-                .ok()
-                .filter(|name| !name.is_empty()),
-            python: std::env::var("CORPUS_PYTHON")
-                .ok()
-                .filter(|path| !path.is_empty()),
+            model: env("CORPUS_MODEL"),
+            python: env("CORPUS_PYTHON"),
             // ponytail: the shim is read from the source tree; packaging it into the binary
             // is a job for whatever installs corpus, and there is nothing to install yet.
-            kernel_dir: std::env::var("CORPUS_KERNEL_DIR")
+            kernel_dir: env("CORPUS_KERNEL_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel")),
-            trace: std::env::var("CORPUS_TRACE")
-                .ok()
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from),
+                .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel")),
+            trace,
+            window: env_parse("CORPUS_CONTEXT_WINDOW"),
+            max_steps: env_parse("CORPUS_MAX_STEPS"),
+        })
+    }
+
+    /// Every provider the process speaks through is built here: one endpoint, one key, and
+    /// the one trace file, so a batch's traffic is in the report alongside the turn's.
+    fn provider(&self, model: &str) -> Provider {
+        let provider = Provider::new(&self.base_url, &self.api_key, model);
+        match &self.trace {
+            Some(trace) => provider.tracing_to(trace.clone()),
+            None => provider,
         }
     }
 }
@@ -188,9 +213,9 @@ impl Config {
 /// gets a virtualenv of its own beside the shim, because the `python3` on PATH belongs to
 /// the system and installing into it is not ours to do. A kernel without the packages
 /// still starts: a session that cannot write a PDF beats no session at all.
-fn kernel_python(kernel_dir: &Path, configured: Option<String>) -> String {
+fn kernel_python(kernel_dir: &Path, configured: Option<&str>) -> String {
     if let Some(python) = configured {
-        return python;
+        return python.to_string();
     }
     match prepare(&kernel_dir.join(".venv")) {
         Ok(python) => python.to_string_lossy().into_owned(),
@@ -226,24 +251,15 @@ fn prepare(venv: &Path) -> Result<PathBuf> {
 }
 
 fn build(venv: &Path) -> Result<()> {
-    run(
-        "python3".as_ref(),
-        &["-m".as_ref(), "venv".as_ref(), venv.as_os_str()],
-    )?;
-    let mut install: Vec<&OsStr> = vec![
-        "-m".as_ref(),
-        "pip".as_ref(),
-        "install".as_ref(),
-        "--quiet".as_ref(),
-    ];
-    install.extend(PACKAGES.iter().map(OsStr::new));
-    run(venv.join("bin/python3").as_os_str(), &install)
+    run(std::process::Command::new("python3").args(["-m", "venv"]).arg(venv))?;
+    run(std::process::Command::new(venv.join("bin/python3"))
+        .args(["-m", "pip", "install", "--quiet"])
+        .args(PACKAGES))
 }
 
-fn run(program: &OsStr, args: &[&OsStr]) -> Result<()> {
-    let program = program.to_string_lossy().into_owned();
-    let status = std::process::Command::new(&program)
-        .args(args)
+fn run(command: &mut std::process::Command) -> Result<()> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let status = command
         .status()
         .with_context(|| format!("cannot run {program}"))?;
     if !status.success() {
@@ -261,7 +277,7 @@ enum Render {
 
 pub struct Sink {
     render: Render,
-    log: Option<std::fs::File>,
+    log: Option<Jsonl>,
     /// Set while a cell is being written, so its code is opened off the line above it.
     writing: bool,
     /// Set once the turn has streamed any answer text, so the one the loop writes for
@@ -271,23 +287,7 @@ pub struct Sink {
 
 impl Sink {
     fn new(render: Render, path: Option<&Path>) -> Result<Sink> {
-        let log = match path {
-            Some(path) => {
-                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    std::fs::create_dir_all(parent)?;
-                }
-                Some(
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                        .with_context(|| {
-                            format!("cannot write the session log at {}", path.display())
-                        })?,
-                )
-            }
-            None => None,
-        };
+        let log = path.map(Jsonl::to).transpose()?;
         Ok(Sink {
             render,
             log,
@@ -303,8 +303,8 @@ impl Sink {
             *text = host::scrub(text);
         }
 
-        if let Some(log) = &mut self.log {
-            let _ = writeln!(log, "{}", stamped(&event));
+        if let Some(log) = &self.log {
+            log.record(&event);
         }
         match self.render {
             Render::Protocol => {
@@ -378,26 +378,13 @@ impl Sink {
 /// The session, and what the screen can already say about it. Nothing waits on the
 /// window: it is a readout, not a prerequisite.
 async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
-    let config = Config::from_env();
-    let python = kernel_python(&config.kernel_dir, config.python);
+    let config = Config::from_env()?;
+    let python = kernel_python(&config.kernel_dir, config.python.as_deref());
     let kernel = Kernel::start(&python, &config.kernel_dir, Tools::NAMES)
         .await
         .context("could not start the python kernel; set CORPUS_PYTHON if python3 is elsewhere")?;
-    let mut provider = Provider::new(
-        &config.base_url,
-        &config.api_key,
-        config.model.unwrap_or_default(),
-    );
-    if let Some(path) = &config.trace {
-        eprintln!("wire trace: {}", path.display());
-        provider = provider.tracing_to(path)?;
-    }
-    // The listing is the only place an OpenAI-compatible provider states its context
-    // window, and it costs a request to ask, so naming the window outright skips it.
-    let mut window: u32 = std::env::var("CORPUS_CONTEXT_WINDOW")
-        .ok()
-        .and_then(|tokens| tokens.parse().ok())
-        .unwrap_or(0);
+    let mut provider = config.provider(config.model.as_deref().unwrap_or_default());
+    let mut window: u32 = config.window.unwrap_or(0);
     if provider.model.is_empty() {
         let first = provider
             .models()
@@ -417,7 +404,7 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         // slower start: the readout fills itself in whenever the answer lands, and
         // plenty of providers state no window at all and never answer with one.
         0 => {
-            let ask = Provider::new(&config.base_url, &config.api_key, model.clone());
+            let ask = config.provider(&model);
             let named = model.clone();
             tokio::spawn(async move {
                 let listed = ask.models().await.unwrap_or_default();
@@ -433,17 +420,10 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         }
     }
     let budget = Budget {
-        max_steps: std::env::var("CORPUS_MAX_STEPS")
-            .ok()
-            .and_then(|steps| steps.parse().ok())
-            .unwrap_or(Budget::default().max_steps),
+        max_steps: config.max_steps.unwrap_or(Budget::default().max_steps),
         ..Budget::default()
     };
-    let tools = Tools::new(Provider::new(
-        &config.base_url,
-        &config.api_key,
-        model.clone(),
-    ));
+    let tools = Tools::new(config.provider(&model));
     let mut agent = Agent::new(provider, kernel, Arc::new(tools), SYSTEM_PROMPT, budget);
     if let Some(path) = resume {
         agent.replay(read_log(path)?);

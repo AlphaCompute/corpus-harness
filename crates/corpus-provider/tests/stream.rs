@@ -1,4 +1,4 @@
-use corpus_provider::{Completion, Delta, Message, Provider, Role, StopReason, Tool};
+use corpus_provider::{Completion, Delta, Jsonl, Message, Provider, Role, StopReason, Tool};
 use corpus_testkit::{delta, finish, refused, serve, sse, truncated};
 
 async fn ask(base_url: &str) -> (Completion, String) {
@@ -121,8 +121,7 @@ async fn the_wire_trace_keeps_what_the_stream_actually_carried() {
     let path = std::env::temp_dir().join(format!("corpus-trace-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let provider = Provider::new(&serve(vec![body]).await.url, "test-key", "test-model")
-        .tracing_to(&path)
-        .unwrap();
+        .tracing_to(std::sync::Arc::new(Jsonl::to(&path).unwrap()));
     let completion = provider
         .stream(&[Message::text(Role::User, "hi")], &[], &mut |_| {})
         .await

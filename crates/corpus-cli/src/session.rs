@@ -3,6 +3,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use corpus_agent::{Agent, Event, Interrupt};
+use corpus_kernel::encode;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout};
@@ -32,18 +33,17 @@ pub enum Command {
 
 pub struct Local {
     pub session_id: Uuid,
-    model: String,
+    /// Taken by the announcement, which is what makes it happen once.
+    model: Option<String>,
     agent: Agent,
-    announced: bool,
 }
 
 impl Local {
     pub fn new(agent: Agent, model: String) -> Local {
         Local {
             session_id: Uuid::now_v7(),
-            model,
+            model: Some(model),
             agent,
-            announced: false,
         }
     }
 }
@@ -51,11 +51,10 @@ impl Local {
 #[async_trait]
 impl Session for Local {
     async fn run(&mut self, prompt: &str, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<()> {
-        if !self.announced {
-            self.announced = true;
+        if let Some(model) = self.model.take() {
             on_event(Event::SessionStart {
                 session_id: self.session_id,
-                model: self.model.clone(),
+                model,
             });
         }
         self.agent.run(prompt, on_event).await?;
@@ -155,12 +154,4 @@ impl Session for Remote {
             let _ = writes.send(frame.clone());
         })
     }
-}
-
-/// A command as it goes on the wire: one JSON object, one line.
-fn encode(command: &Command) -> String {
-    format!(
-        "{}\n",
-        serde_json::to_string(command).expect("a string and a unit variant")
-    )
 }

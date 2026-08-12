@@ -131,25 +131,6 @@ pub fn python_code(args: &Value) -> Option<&str> {
     args["code"].as_str()
 }
 
-/// A monotonic counter rather than a flag: a receiver taken at the start of a turn
-/// only ever sees interrupts raised after it, so a stale one cannot kill the next turn.
-#[derive(Clone)]
-struct Cancel(tokio::sync::watch::Sender<u64>);
-
-impl Cancel {
-    fn new() -> Cancel {
-        Cancel(tokio::sync::watch::channel(0).0)
-    }
-
-    fn raise(&self) {
-        self.0.send_modify(|count| *count += 1);
-    }
-
-    fn watch(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.0.subscribe()
-    }
-}
-
 pub struct Outcome {
     pub text: String,
     pub stop: StopReason,
@@ -158,7 +139,9 @@ pub struct Outcome {
 
 pub struct Agent {
     pub id: Uuid,
-    cancel: Cancel,
+    /// A monotonic counter rather than a flag: a receiver taken at the start of a turn
+    /// only ever sees interrupts raised after it, so a stale one cannot kill the next turn.
+    cancel: tokio::sync::watch::Sender<u64>,
     provider: Provider,
     kernel: Kernel,
     host: Arc<dyn Host>,
@@ -177,7 +160,7 @@ impl Agent {
     ) -> Agent {
         Agent {
             id: Uuid::now_v7(),
-            cancel: Cancel::new(),
+            cancel: tokio::sync::watch::channel(0).0,
             provider,
             kernel,
             host,
@@ -203,7 +186,7 @@ impl Agent {
         let cancel = self.cancel.clone();
         let kernel = self.kernel.interrupter();
         Interrupt::new(move || {
-            cancel.raise();
+            cancel.send_modify(|count| *count += 1);
             kernel.raise();
         })
     }
@@ -278,7 +261,7 @@ impl Agent {
         self.messages.push(Message::text(Role::User, prompt));
 
         let started = Instant::now();
-        let mut cancelled = self.cancel.watch();
+        let mut cancelled = self.cancel.subscribe();
         let mut usage = Usage::default();
         let mut context = 0;
         let mut answer = String::new();

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -58,15 +59,13 @@ pub fn stamped<T: Serialize>(value: &T) -> String {
     }
 }
 
-/// What the inference server actually sent, before anything here has read it. The session
-/// log holds this crate's interpretation of the stream — control tokens stripped, thinking
-/// split from answer, text held back and re-filed — which is the wrong evidence to take to
-/// whoever runs the server. This is the wire itself, and it is the file to attach to a
-/// bug report.
-pub struct Trace(std::sync::Mutex<std::fs::File>);
+/// An append-only file of JSON lines, each stamped with the moment it was written. The
+/// wire trace and the session log are both exactly this, so they open and write it the
+/// same way rather than each spelling the same four steps out.
+pub struct Jsonl(std::sync::Mutex<std::fs::File>);
 
-impl Trace {
-    pub fn to(path: &std::path::Path) -> Result<Trace> {
+impl Jsonl {
+    pub fn to(path: &std::path::Path) -> Result<Jsonl> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
@@ -74,15 +73,15 @@ impl Trace {
             .create(true)
             .append(true)
             .open(path)
-            .with_context(|| format!("cannot write the wire trace at {}", path.display()))?;
-        Ok(Trace(std::sync::Mutex::new(file)))
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        Ok(Jsonl(std::sync::Mutex::new(file)))
     }
 
-    /// Never fails the request it is recording: a trace that cannot be written is worth
-    /// less than the turn it would have interrupted.
-    fn record(&self, entry: Value) {
+    /// Never fails whatever it is recording: a line that cannot be written is worth less
+    /// than the turn it would have interrupted.
+    pub fn record<T: Serialize>(&self, entry: &T) {
         if let Ok(mut file) = self.0.lock() {
-            let _ = writeln!(file, "{}", stamped(&entry));
+            let _ = writeln!(file, "{}", stamped(entry));
         }
     }
 }
@@ -274,7 +273,14 @@ pub struct Provider {
     base_url: String,
     api_key: String,
     pub model: String,
-    trace: Option<Trace>,
+    /// What the inference server actually sent, before anything here has read it. The
+    /// session log holds this crate's interpretation of the stream — control tokens
+    /// stripped, thinking split from answer, text held back and re-filed — which is the
+    /// wrong evidence to take to whoever runs the server. This is the wire itself, and it
+    /// is the file to attach to a bug report. Shared, so every provider built against one
+    /// endpoint writes to the one file: a batch's traffic is the traffic a batch bug
+    /// report needs.
+    trace: Option<Arc<Jsonl>>,
 }
 
 impl Provider {
@@ -296,10 +302,10 @@ impl Provider {
         }
     }
 
-    /// Records the wire to this file for as long as the provider lives.
-    pub fn tracing_to(mut self, path: &std::path::Path) -> Result<Provider> {
-        self.trace = Some(Trace::to(path)?);
-        Ok(self)
+    /// Records the wire for as long as the provider lives.
+    pub fn tracing_to(mut self, trace: Arc<Jsonl>) -> Provider {
+        self.trace = Some(trace);
+        self
     }
 
     /// What this provider offers, in the order it lists them.
@@ -374,7 +380,7 @@ impl Provider {
         if let Some(trace) = &self.trace {
             // The body itself stays out: it carries the whole conversation. What a report
             // needs from this side is which model was asked, and how big the ask was.
-            trace.record(json!({ "post": {
+            trace.record(&json!({ "post": {
                 "url": url,
                 "model": self.model,
                 "bytes": body.to_string().len(),
@@ -394,7 +400,7 @@ impl Provider {
         let status = response.status();
         if let Some(trace) = &self.trace {
             // Stamped where the headers land, so the wait before it is the model's own.
-            trace.record(json!({ "status": status.as_u16() }));
+            trace.record(&json!({ "status": status.as_u16() }));
         }
         if !status.is_success() {
             let detail = response.text().await.unwrap_or_default();
@@ -407,6 +413,16 @@ impl Provider {
         let mut acc = Acc::default();
         let mut line = Vec::new();
         let mut read = 0;
+        // Which read a line came off is what tells a buffered server from a streaming one:
+        // equal timestamps could be luck, one read cannot.
+        let trace = self.trace.as_deref();
+        let traced = |read: u32, line: &[u8]| {
+            if let Some(trace) = trace
+                && !line.is_empty()
+            {
+                trace.record(&json!({ "read": read, "line": String::from_utf8_lossy(line) }));
+            }
+        };
         while let Some(chunk) = response.chunk().await.map_err(Failure::transport)? {
             read += 1;
             // A line at a time, not a byte at a time: an event arrives split across chunks
@@ -415,13 +431,7 @@ impl Provider {
             while let Some(at) = rest.iter().position(|byte| *byte == b'\n') {
                 line.extend_from_slice(&rest[..at]);
                 rest = &rest[at + 1..];
-                // Which read a line came off is what tells a buffered server from a
-                // streaming one: equal timestamps could be luck, one read cannot.
-                if let Some(trace) = &self.trace
-                    && !line.is_empty()
-                {
-                    trace.record(json!({ "read": read, "line": String::from_utf8_lossy(&line) }));
-                }
+                traced(read, &line);
                 if acc.feed(&line, on_delta) {
                     acc.flush(on_delta);
                     return Ok(acc.finish());
@@ -431,11 +441,7 @@ impl Provider {
             line.extend_from_slice(rest);
         }
         // Whatever the stream ended on without a newline of its own.
-        if let Some(trace) = &self.trace
-            && !line.is_empty()
-        {
-            trace.record(json!({ "read": read, "line": String::from_utf8_lossy(&line) }));
-        }
+        traced(read, &line);
         acc.feed(&line, on_delta);
         acc.flush(on_delta);
         Ok(acc.finish())
