@@ -197,9 +197,9 @@ pub struct Outcome {
 
 /// How to start an interpreter, for an agent that may never ask for one. An agent that
 /// only reads what it was sent and answers costs nothing but the model call.
-pub struct Kernels(
-    Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Kernel>> + Send>> + Send + Sync>,
-);
+pub struct Kernels(Box<dyn Fn() -> Starting + Send + Sync>);
+
+type Starting = Pin<Box<dyn Future<Output = Result<Kernel>> + Send>>;
 
 impl Kernels {
     pub fn new<F>(start: impl Fn() -> F + Send + Sync + 'static) -> Kernels
@@ -239,7 +239,15 @@ impl Agent {
         system_prompt: &str,
         budget: Budget,
     ) -> Agent {
-        Agent::build(id, provider, Some(kernel), None, host, system_prompt, budget)
+        Agent::build(
+            id,
+            provider,
+            Some(kernel),
+            None,
+            host,
+            system_prompt,
+            budget,
+        )
     }
 
     /// An agent that starts its interpreter the first time it writes a cell.

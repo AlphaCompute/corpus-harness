@@ -45,13 +45,8 @@ impl Tools {
         static WITH_CHILDREN: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
         match delegating {
             false => Tools::LEAF,
-            true => WITH_CHILDREN.get_or_init(|| {
-                Tools::LEAF
-                    .iter()
-                    .copied()
-                    .chain(Children::NAMES)
-                    .collect()
-            }),
+            true => WITH_CHILDREN
+                .get_or_init(|| Tools::LEAF.iter().copied().chain(Children::NAMES).collect()),
         }
     }
 

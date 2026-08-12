@@ -92,7 +92,9 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
             // interrupt is testing anything.
             if !stopped
                 && event["t"] == "tool_stream"
-                && event["text"].as_str().is_some_and(|text| text.contains("waiting"))
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("waiting"))
             {
                 stopped = true;
                 stdin.write_all(b"{\"cmd\":\"interrupt\"}\n").await.unwrap();
@@ -130,6 +132,51 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
     );
 }
 
+/// An answer that cost tokens, so a session can be billed for what its agents spend.
+fn says_costing(text: &str, input: u32, output: u32) -> Vec<u8> {
+    corpus_testkit::sse(&[
+        &corpus_testkit::delta(&format!(r#""content":{}"#, Value::String(text.to_string()))),
+        &format!(
+            r#"{{"choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{input},"completion_tokens":{output}}}}}"#
+        ),
+    ])
+}
+
+/// What the children spend is spent by the session, so it lands on the turn's bill. It
+/// does not land on the window readout: a child fills a window of its own, and a session
+/// that read 100k tokens through its agents has not filled its own context by 100k.
+#[tokio::test]
+async fn what_an_agent_spends_is_on_its_parents_bill_and_not_in_its_context() {
+    let dir = workdir("usage");
+    let log = dir.join("session.jsonl");
+    let endpoint = serve(vec![
+        // The cell waits, so the child is finished and counted before the turn ends.
+        runs_python(
+            "call_1",
+            "kid = spawn('read it')\nwhile kid.result(timeout=10) is None: pass\n",
+        ),
+        says_costing("What the agent found.", 500, 200),
+        says_costing("Read.", 11, 2),
+    ])
+    .await;
+
+    corpus(&endpoint, "Read it through an agent.", &log).await;
+
+    let ended = events(&log)
+        .into_iter()
+        .rfind(|event| event["t"] == "turn_end")
+        .expect("the turn ended");
+    assert_eq!(
+        ended["usage"]["input"], 511,
+        "the agent's 500 belong on the bill beside the session's own 11: {ended}"
+    );
+    assert_eq!(ended["usage"]["output"], 202, "{ended}");
+    assert_eq!(
+        ended["context"], 11,
+        "how full the window is was never the sum of every agent's: {ended}"
+    );
+}
+
 /// A child coming back rings the doorbell: the session takes a turn nobody typed, and is
 /// told which agent finished and roughly what it holds — not the answer itself, which is
 /// one `result()` away and would otherwise sit in the context for good.
@@ -137,8 +184,7 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
 async fn an_agent_coming_back_is_a_turn_the_session_takes_on_its_own() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let long = "The numbers are 3, 5 and 8, and here is a great deal more about them: "
-        .repeat(6);
+    let long = "The numbers are 3, 5 and 8, and here is a great deal more about them: ".repeat(6);
     let endpoint = serve(vec![
         runs_python(
             "call_1",
@@ -266,10 +312,9 @@ async fn a_cell_sends_an_agent_off_and_reads_what_it_answered() {
         "one child, one identity, from the line that starts it to the line that ends it"
     );
     assert!(
-        log.iter().any(
-            |event| event["t"] == "answer" && event["agent"] == started["agent"]
-                && event["text"] == "Margins fell by a fifth."
-        ),
+        log.iter().any(|event| event["t"] == "answer"
+            && event["agent"] == started["agent"]
+            && event["text"] == "Margins fell by a fifth."),
         "the child's own stream belongs in the log under its own name"
     );
 }

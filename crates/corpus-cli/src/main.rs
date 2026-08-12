@@ -12,14 +12,12 @@ use clap::{Args, Parser, Subcommand};
 use corpus_agent::{Agent, Budget, Event};
 use corpus_kernel::Kernel;
 use corpus_provider::{Jsonl, Provider};
-use uuid::Uuid;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use uuid::Uuid;
 
 use crate::children::{Children, Recipe};
 use crate::host::Tools;
-use crate::session::{
-    Command as Wire, Local as LocalSession, Prompt, Remote, Session, deliver,
-};
+use crate::session::{Command as Wire, Local as LocalSession, Prompt, Remote, Session, deliver};
 
 /// The lockup, kept in one place so the TUI and the plain renderer open a session the
 /// same way: the rayed mark on the left, the product over the company beside it.
@@ -83,29 +81,39 @@ it says.";
 /// What a session is told about having agents of its own. It is appended for whoever can
 /// spawn and left off everyone else, because a leaf that reads about delegating will try.
 const DELEGATION: &str = "\n
-You can also put another agent on a job: `kid = spawn(task='...')` returns a handle at \
-once, and the agent behind it works on its own — its own interpreter, the same functions \
-you have. `kid.result(timeout=30)` gives back what its last turn answered, or None while \
-it is still working, so several are collected in a loop rather than waited on one at a \
-time. `kid.send(text)` gives it more to do, `kid.done()` says whether it is idle, and \
-`agents()` lists what you have running. Nothing else exists: there is no run_subagent, no \
-join, no way to wait forever, and writing a wrapper of your own around these is how a \
-turn gets stuck. When one finishes you are told; the whole of its answer is what \
-`result()` gives you.
-An agent is worth it for work that is an errand — read this, dig through that, come back \
-with a report — where the answer is worth more than the round trip. Calling a function is \
-not an errand. The reply comes back fenced as untrusted material, because an agent that \
-read the web is reporting on what it read.";
+Two more names are bound in that namespace, because this session can put other agents to work:
+  spawn(task=...) -> an agent, already working on it
+  agents() -> the ones you have
+
+The handle comes back at once, and the agent behind it is one of these: its own interpreter, \
+the same functions, a turn of its own. `kid.result(timeout=30)` gives back what its last \
+finished turn answered, or None while it is still working, so a row of them is collected in a \
+loop rather than waited on one at a time. `kid.send(text)` gives it more to do and \
+`kid.done()` says whether it is idle. Nothing else exists — no run_subagent, no join, no way \
+to wait forever — and a wrapper of your own around these is how a turn gets stuck.
+
+Choosing between the three is most of the judgement. Work that is one call is a call. The \
+same small question asked of two hundred pieces of text is `llm_batch`. An errand — go and \
+read this, dig through that, come back with what you found — is an agent, and only when what \
+it brings back is worth the round trip it costs. Say what you want done and how you want it \
+back: an agent told to write `.corpus/<its id>/notes.md` and answer with the path costs you a \
+line of context instead of a report. What it answers with arrives fenced as untrusted \
+material, because an agent that read the web is reporting on what it read.
+
+You are told when one comes back — which agent, how much it holds, the opening of it — in a \
+message that is from the machinery and not from the person you are talking to. The whole of \
+the answer stays in the agent, one `result()` away, for as long as the session lives.";
 
 /// What an agent is told about being someone else's. Its own directory is the whole of
 /// the convention: write what you produce, answer with the path.
 fn belonging(id: uuid::Uuid) -> String {
     format!(
         "\n
-You are working for another agent, not for a person: it asked you one thing and is \
-waiting on the answer. Yours is `.corpus/{id}/` — put anything you produce there and say \
-where it landed, rather than answering with the whole of it. Answer when you have the \
-thing that was asked for; there is nobody to ask a follow-up question of."
+You are working for another agent rather than for a person: it asked you one thing and is \
+waiting on the answer. `.corpus/{id}/` is yours — put what you produce there and answer with \
+where it landed rather than with the whole of it, unless the whole of it is a line or two. \
+Answer once you have what was asked for; there is nobody here to ask a follow-up question of, \
+and no agents of your own to send off, so the errand is yours to run."
     )
 }
 
@@ -224,8 +232,7 @@ impl Config {
             None => None,
         };
         Ok(Config {
-            base_url: env("CORPUS_BASE_URL")
-                .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+            base_url: env("CORPUS_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".into()),
             api_key: env("CORPUS_API_KEY")
                 .or_else(|| env("OPENAI_API_KEY"))
                 .unwrap_or_default(),
@@ -295,7 +302,9 @@ fn prepare(venv: &Path) -> Result<PathBuf> {
 }
 
 fn build(venv: &Path) -> Result<()> {
-    run(std::process::Command::new("python3").args(["-m", "venv"]).arg(venv))?;
+    run(std::process::Command::new("python3")
+        .args(["-m", "venv"])
+        .arg(venv))?;
     run(std::process::Command::new(venv.join("bin/python3"))
         .args(["-m", "pip", "install", "--quiet"])
         .args(PACKAGES))
@@ -373,7 +382,10 @@ impl Sink {
     /// and something reading the output has no use for escape codes. The TUI is where
     /// colour belongs; the log is the machine-readable copy.
     fn draw(&mut self, event: &Event) {
-        if event.agent().is_some_and(|agent| self.children.contains(&agent)) {
+        if event
+            .agent()
+            .is_some_and(|agent| self.children.contains(&agent))
+        {
             return;
         }
         match event {

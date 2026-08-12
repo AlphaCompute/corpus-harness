@@ -412,7 +412,8 @@ impl App {
             kids: std::collections::HashMap::new(),
         };
         let brand = Style::new().fg(BRAND);
-        app.transcript.push_ready(Line::styled(MARK[0], brand), false);
+        app.transcript
+            .push_ready(Line::styled(MARK[0], brand), false);
         app.transcript.push_ready(
             Line::from(vec![
                 Span::styled(MARK[1], brand),
@@ -468,8 +469,10 @@ impl App {
             Event::AgentStart { agent, task, .. } => {
                 self.answer_at = None;
                 self.transcript.blank();
-                self.transcript
-                    .push_ready(step("·", ACCENT, "agent", one_line(&task), String::new()), true);
+                self.transcript.push_ready(
+                    step("·", ACCENT, "agent", one_line(&task), String::new()),
+                    true,
+                );
                 self.kids.insert(agent, task);
             }
             Event::AgentEnd {
@@ -1482,8 +1485,7 @@ mod tests {
         let mut app = App::new();
         app.transcript.rewrap(12);
         assert_eq!(
-            app.transcript.wrapped[2].spans[FLEX_SPAN].content,
-            WORDMARK,
+            app.transcript.wrapped[2].spans[FLEX_SPAN].content, WORDMARK,
             "the wordmark is not something the mark is willing to lose"
         );
     }
@@ -1493,8 +1495,11 @@ mod tests {
     #[test]
     fn a_multi_line_error_becomes_one_transcript_line_each() {
         let mut app = App::new();
-        app.transcript
-            .line(0, Style::new(), "provider returned 500:\n<html>\nbad gateway");
+        app.transcript.line(
+            0,
+            Style::new(),
+            "provider returned 500:\n<html>\nbad gateway",
+        );
 
         let rows: Vec<String> = screen(&mut app, 40, 12)
             .lines()
@@ -1806,4 +1811,3 @@ mod tests {
         assert!(app.input.is_empty());
     }
 }
-

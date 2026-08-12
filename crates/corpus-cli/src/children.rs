@@ -129,7 +129,12 @@ impl Children {
 
     /// The child's own loop: one turn per message, for as long as anyone can reach it.
     /// It ends when the session does, because the inbox is only held by the registry.
-    fn raise(&self, id: Uuid, mut mail: mpsc::UnboundedReceiver<String>, status: Arc<watch::Sender<Status>>) {
+    fn raise(
+        &self,
+        id: Uuid,
+        mut mail: mpsc::UnboundedReceiver<String>,
+        status: Arc<watch::Sender<Status>>,
+    ) {
         let recipe = self.recipe.clone();
         let events = self.events.clone();
         let turns = self.turns.clone();

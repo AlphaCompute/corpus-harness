@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use corpus_agent::{Agent, Event, Interrupt};
 use corpus_kernel::encode;
+use corpus_provider::Usage;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout};
@@ -45,9 +46,26 @@ pub trait Session: Send {
 
 /// Kept for the boundary. A free function because a turn has the session taken apart
 /// field by field, which is what lets a child be heard while its parent is thinking.
-fn keep(news: &mut Vec<Event>, event: &Event) {
-    if matches!(event, Event::AgentEnd { .. }) {
-        news.push(event.clone());
+fn keep(news: &mut Vec<Event>, spent: &mut Usage, event: &Event) {
+    match event {
+        Event::AgentEnd { .. } => news.push(event.clone()),
+        // Only a child's turns come this way, and what a child spent is spent by the
+        // session: it goes on the turn's bill. Not on `context` — that one says how full
+        // the window is, and a child fills a window of its own.
+        Event::TurnEnd { usage, .. } => {
+            spent.input += usage.input;
+            spent.output += usage.output;
+        }
+        _ => {}
+    }
+}
+
+/// The turn's own ending, with whatever its children spent while it ran folded in.
+fn bill(spent: &mut Usage, event: &mut Event) {
+    if let Event::TurnEnd { usage, .. } = event {
+        usage.input += spent.input;
+        usage.output += spent.output;
+        *spent = Usage::default();
     }
 }
 
@@ -93,6 +111,8 @@ pub struct Local {
     /// its parent was busy is exactly the case notifying exists for, so what lands mid-turn
     /// waits here for the boundary rather than being shown and forgotten.
     news: Vec<Event>,
+    /// What the children have spent and nobody has been billed for yet.
+    spent: Usage,
 }
 
 impl Local {
@@ -104,6 +124,7 @@ impl Local {
             children,
             autonomous: 0,
             news: Vec::new(),
+            spent: Usage::default(),
         }
     }
 }
@@ -164,9 +185,7 @@ impl Session for Local {
 
 impl Local {
     fn remember(&mut self, event: &Event) {
-        if matches!(event, Event::AgentEnd { .. }) {
-            self.news.push(event.clone());
-        }
+        keep(&mut self.news, &mut self.spent, event);
     }
 
     async fn turn(
@@ -190,6 +209,7 @@ impl Local {
             agent,
             children,
             news,
+            spent,
             ..
         } = self;
         let (told, mut mine) = mpsc::unbounded_channel();
@@ -202,20 +222,24 @@ impl Local {
             tokio::select! {
                 biased;
                 outcome = &mut turn => break outcome,
-                Some(event) = mine.recv() => on_event(event),
+                Some(mut event) = mine.recv() => {
+                    bill(spent, &mut event);
+                    on_event(event);
+                }
                 Some(event) = children.recv() => {
-                    keep(news, &event);
+                    keep(news, spent, &event);
                     on_event(event);
                 }
             }
         };
         // The turn ends holding whatever it said last, `TurnEnd` among it: a caller that
         // learns the turn is over before it hears the end of it has been told twice.
-        while let Ok(event) = mine.try_recv() {
+        while let Ok(mut event) = mine.try_recv() {
+            bill(spent, &mut event);
             on_event(event);
         }
         while let Ok(event) = children.try_recv() {
-            keep(news, &event);
+            keep(news, spent, &event);
             on_event(event);
         }
         outcome?;
