@@ -45,6 +45,91 @@ fn printed(log: &Path) -> String {
         .collect()
 }
 
+/// Ctrl-C stops the cell a person is watching, and nothing else. The agents that cell
+/// sent off keep working — killing them would throw away the very thing being waited on —
+/// and the handles are still in the namespace on the other side of the interrupt.
+#[tokio::test]
+async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let waiting = "kid = spawn('a job that takes a while')\n\
+                   print('waiting')\n\
+                   print('answered:', kid.result(timeout=300))\n";
+    let looking = "print('still mine:', [agent.task for agent in agents()], 'done:', kid.done())";
+    let endpoint = serve(vec![
+        runs_python("call_1", waiting),
+        // The child's own cell, which keeps it busy for longer than this test lives.
+        runs_python("call_2", "import time; time.sleep(30)"),
+        runs_python("call_3", looking),
+        says("It is still at it."),
+    ])
+    .await;
+
+    let mut child = tokio::process::Command::new(BIN)
+        .env("CORPUS_BASE_URL", &endpoint.url)
+        .env("CORPUS_API_KEY", "test-key")
+        .env("CORPUS_MODEL", "test-model")
+        .env("CORPUS_KERNEL_DIR", kernel_dir())
+        .arg("serve")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+
+    let session = async {
+        stdin
+            .write_all(b"{\"cmd\":\"run\",\"text\":\"Send one off and wait.\"}\n")
+            .await
+            .unwrap();
+        let mut stopped = false;
+        let mut printed = String::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            // The cell says when it has reached the wait, which is the only moment an
+            // interrupt is testing anything.
+            if !stopped
+                && event["t"] == "tool_stream"
+                && event["text"].as_str().is_some_and(|text| text.contains("waiting"))
+            {
+                stopped = true;
+                stdin.write_all(b"{\"cmd\":\"interrupt\"}\n").await.unwrap();
+            }
+            if event["t"] == "turn_end" {
+                break;
+            }
+        }
+        stdin
+            .write_all(b"{\"cmd\":\"run\",\"text\":\"What have you got?\"}\n")
+            .await
+            .unwrap();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            if event["t"] == "tool_stream" {
+                printed.push_str(event["text"].as_str().unwrap_or_default());
+            }
+            if event["t"] == "turn_end" {
+                break;
+            }
+        }
+        printed
+    };
+
+    let printed = tokio::time::timeout(std::time::Duration::from_secs(60), session)
+        .await
+        .expect("the interrupted session never came back");
+    assert!(
+        printed.contains("still mine: ['a job that takes a while']"),
+        "the handle must survive the interrupt: {printed}"
+    );
+    assert!(
+        printed.contains("done: False"),
+        "the agent must still be working: {printed}"
+    );
+}
+
 /// One cell sends an agent off and waits for it in a loop, which is the shape the prompt
 /// asks for. Three model calls: the cell, the child's turn, and the answer that follows.
 #[tokio::test]
@@ -100,6 +185,45 @@ async fn a_cell_sends_an_agent_off_and_reads_what_it_answered() {
                 && event["text"] == "Margins fell by a fifth."
         ),
         "the child's own stream belongs in the log under its own name"
+    );
+}
+
+/// More work for an agent that already has some. The inbox is the queue, so `send` never
+/// refuses and never waits; what comes back once it has settled is its latest turn, and
+/// the turn after remembers the turn before, because it is one agent throughout.
+#[tokio::test]
+async fn more_work_for_a_busy_agent_waits_in_its_inbox() {
+    let dir = workdir("send");
+    let log = dir.join("session.jsonl");
+    let code = "kid = spawn('count the first report')\n\
+                kid.send('now the second, in the same words')\n\
+                while (answer := kid.result(timeout=10)) is None:\n\
+                \x20   pass\n\
+                print('last of it:', answer)\n\
+                print('the ones I have:', [agent.task for agent in agents()])\n";
+    let endpoint = serve(vec![
+        runs_python("call_1", code),
+        says("The first has nine tables."),
+        says("The second has four."),
+        says("Nine and four."),
+    ])
+    .await;
+
+    corpus(&endpoint, "Count the tables in both.", &log).await;
+
+    let printed = printed(&log);
+    assert!(
+        printed.contains("last of it:") && printed.contains("The second has four."),
+        "what settles last is what result gives back: {printed}"
+    );
+    assert!(
+        printed.contains("the ones I have: ['count the first report']"),
+        "a handle outlives the turn it was made in: {printed}"
+    );
+    let second = &endpoint.requests()[2];
+    assert!(
+        second.contains("The first has nine tables.") && second.contains("now the second"),
+        "the second turn is the same agent's, and it remembers the first: {second}"
     );
 }
 
