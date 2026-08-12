@@ -2,3 +2,7 @@
 .env
 .corpus/
 kernel/.venv
+__pycache__/
+.idea/
+# Whatever CORPUS_TRACE was pointed at holds a session's own text, verbatim.
+wire.jsonl
