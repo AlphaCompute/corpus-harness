@@ -168,12 +168,15 @@ impl Children {
                         Err(why) => why,
                     }),
                 });
+                // The latest turn is the answer, whichever way it went: an agent that
+                // worked once and broke since must not keep handing back what it said
+                // the first time.
                 status.send_modify(|state| {
                     state.busy = false;
-                    match answered {
-                        Ok(text) => state.answer = Some(text),
-                        Err(why) => state.failed = Some(why),
-                    }
+                    (state.answer, state.failed) = match answered {
+                        Ok(text) => (Some(text), None),
+                        Err(why) => (None, Some(why)),
+                    };
                 });
                 drop(permit);
             }
