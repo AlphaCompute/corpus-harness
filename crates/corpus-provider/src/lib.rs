@@ -22,7 +22,7 @@ const THOUGHT_END: &str = "</think>";
 const HOLD: usize = 200;
 
 /// Silence, not slowness. While bytes keep arriving the clock keeps resetting, so a
-/// long answer is safe and a dead connection is not (§9.3). The window that has to fit
+/// long answer is safe and a dead connection is not. The window that has to fit
 /// under this is the one before the first byte: a reasoning model prefills and thinks
 /// with nothing on the wire, and at ~100k of context that is minutes, not seconds.
 const SILENCE: Duration = Duration::from_secs(300);
@@ -35,7 +35,7 @@ const BACKOFF: Duration = Duration::from_millis(200);
 ///
 /// ponytail: written in UTC, because `now_local` is the call that fails in a process with
 /// threads, and this one has plenty. Whoever reads the line converts.
-pub fn now() -> String {
+fn now() -> String {
     let at = time::OffsetDateTime::now_utc();
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
@@ -51,7 +51,7 @@ pub fn now() -> String {
 
 /// A log line that opens with the moment it was written. Spliced onto the front rather
 /// than built through a map, which would sort the keys and bury the interesting one.
-pub fn stamped<T: Serialize>(value: &T) -> String {
+fn stamped<T: Serialize>(value: &T) -> String {
     let body = serde_json::to_string(value).unwrap_or_default();
     match body.strip_prefix('{').filter(|rest| *rest != "}") {
         Some(rest) => format!("{{\"at\":\"{}\",{rest}", now()),
@@ -77,11 +77,27 @@ impl Jsonl {
         Ok(Jsonl(std::sync::Mutex::new(file)))
     }
 
+    /// Reads back what [`Jsonl::to`] wrote. A line that will not parse is skipped rather
+    /// than failing the read: a log is worth what can still be recovered from it, and the
+    /// last line of one whose writer was killed mid-write is routinely half a line.
+    pub fn read<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        Ok(text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect())
+    }
+
     /// Never fails whatever it is recording: a line that cannot be written is worth less
-    /// than the turn it would have interrupted.
+    /// than the turn it would have interrupted. One `write_all` rather than `writeln!`,
+    /// which splits its format into a syscall per piece: this is on the path of every
+    /// streamed token.
     pub fn record<T: Serialize>(&self, entry: &T) {
+        let mut line = stamped(entry);
+        line.push('\n');
         if let Ok(mut file) = self.0.lock() {
-            let _ = writeln!(file, "{}", stamped(entry));
+            let _ = file.write_all(line.as_bytes());
         }
     }
 }
@@ -151,7 +167,7 @@ impl Message {
     }
 }
 
-/// `id` is minted by the provider and must travel back untouched (§4.1).
+/// `id` is minted by the provider and must travel back untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
     pub id: String,
@@ -652,7 +668,7 @@ impl Acc {
                 }
             }
             // Some models put the whole answer in `reasoning`; reading only `content`
-            // turns those turns into silence (§9.2).
+            // turns those turns into silence.
             for key in ["reasoning", "reasoning_content"] {
                 if let Some(text) = delta[key].as_str().filter(|t| !t.is_empty()) {
                     let text = self.clean_reasoning.feed(text);
@@ -664,7 +680,7 @@ impl Acc {
             }
             for call in delta["tool_calls"].as_array().into_iter().flatten() {
                 // Calls arrive split across deltas and are keyed by index, not by order:
-                // the name lands in the first delta, the arguments in the ones after (§9.4).
+                // the name lands in the first delta, the arguments in the ones after.
                 let slot = self
                     .calls
                     .entry(call["index"].as_u64().unwrap_or(0))

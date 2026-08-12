@@ -338,7 +338,7 @@ async fn the_kernel_leaves_when_its_host_does() {
     let mut stdin = child.stdin.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     stdin
-        .write_all(b"{\"type\":\"init\",\"fns\":[]}\n")
+        .write_all(corpus_kernel::encode(&json!({ "type": "init", "fns": [] })).as_bytes())
         .await
         .unwrap();
     assert!(lines.next_line().await.unwrap().unwrap().contains("ready"));

@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Where the kernel's python shim lives. Every crate in the workspace sits the same
@@ -69,15 +69,23 @@ pub async fn serve(responses: Vec<Vec<u8>>) -> Endpoint {
     }
 }
 
-/// The request line and headers, then the body it announced.
+/// The request line and headers, then the body it announced. Read a line at a time rather
+/// than a byte at a time: a header block is a few hundred bytes, and every test request
+/// pays for however many syscalls that takes.
 async fn drain_request(socket: &mut TcpStream) -> (String, String) {
+    let mut reader = tokio::io::BufReader::new(socket);
     let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        if socket.read_exact(&mut byte).await.is_err() {
-            return (String::new(), String::new());
+    loop {
+        let mut line = Vec::new();
+        match reader.read_until(b'\n', &mut line).await {
+            Ok(0) | Err(_) => return (String::new(), String::new()),
+            Ok(_) => {}
         }
-        head.push(byte[0]);
+        let blank = line == b"\r\n" || line == b"\n";
+        head.extend_from_slice(&line);
+        if blank {
+            break;
+        }
     }
     let length: usize = String::from_utf8_lossy(&head)
         .to_lowercase()
@@ -86,8 +94,10 @@ async fn drain_request(socket: &mut TcpStream) -> (String, String) {
         .and_then(|rest| rest.split("\r\n").next())
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(0);
+    // Off the reader, not the socket: the buffer it filled looking for the blank line has
+    // the first of the body in it already.
     let mut body = vec![0u8; length];
-    let _ = socket.read_exact(&mut body).await;
+    let _ = reader.read_exact(&mut body).await;
     (
         String::from_utf8_lossy(&head).into_owned(),
         String::from_utf8_lossy(&body).into_owned(),
@@ -143,14 +153,20 @@ pub fn says(text: &str) -> Vec<u8> {
     ])
 }
 
-/// A turn that calls `python(code)` and nothing else.
-pub fn runs_python(call_id: &str, code: &str) -> Vec<u8> {
-    let call = serde_json::json!({
+/// The `python(code)` call as it rides inside a delta. Take this one where the turn puts
+/// something else in the same delta; [`runs_python`] is the whole turn.
+pub fn python_call(call_id: &str, code: &str) -> serde_json::Value {
+    serde_json::json!({
         "index": 0,
         "id": call_id,
         "type": "function",
         "function": { "name": "python", "arguments": serde_json::json!({ "code": code }).to_string() },
-    });
+    })
+}
+
+/// A turn that calls `python(code)` and nothing else.
+pub fn runs_python(call_id: &str, code: &str) -> Vec<u8> {
+    let call = python_call(call_id, code);
     sse(&[
         &delta(&format!(r#""tool_calls":[{call}]"#)),
         &finish("tool_calls"),

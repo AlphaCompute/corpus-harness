@@ -109,13 +109,10 @@ enum Entry {
         /// Still being streamed into: the next delta of the same kind extends it.
         open: bool,
     },
-    /// Already styled span by span, so it is placed rather than wrapped. `flex` names the
-    /// span that gives way when the terminal is too narrow, and belongs to whoever built
-    /// the line: a lockup has no span it is willing to lose.
-    Ready {
-        line: Line<'static>,
-        flex: Option<usize>,
-    },
+    /// Already styled span by span, so it is placed rather than wrapped. `flex` says the
+    /// line has a span it will give up when the terminal is too narrow, and belongs to
+    /// whoever built it: a lockup has nothing it is willing to lose.
+    Ready { line: Line<'static>, flex: bool },
 }
 
 #[derive(Default)]
@@ -212,14 +209,14 @@ impl Transcript {
         }
     }
 
-    fn push_ready(&mut self, line: Line<'static>, flex: Option<usize>) {
+    fn push_ready(&mut self, line: Line<'static>, flex: bool) {
         self.touch(self.entries.len());
         self.entries.push(Entry::Ready { line, flex });
     }
 
-    /// Drops everything from `at` and puts one ready-made line in its place.
-    fn replace_line(&mut self, at: usize, line: Line<'static>, flex: Option<usize>) {
-        self.touch(at);
+    /// Drops everything from `at` and puts one ready-made line in its place. `push_ready`
+    /// touches what the truncate left behind, which is this same index.
+    fn replace_line(&mut self, at: usize, line: Line<'static>, flex: bool) {
         self.entries.truncate(at);
         self.push_ready(line, flex);
     }
@@ -261,7 +258,7 @@ impl Transcript {
                     let room = width as usize;
                     let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
                     if total > room
-                        && let Some(span) = flex.and_then(|at| line.spans.get_mut(at))
+                        && let Some(span) = flex.then(|| line.spans.get_mut(FLEX_SPAN)).flatten()
                     {
                         let keep = span
                             .content
@@ -345,8 +342,9 @@ struct App {
     input: Vec<char>,
     cursor: usize,
     queued: Vec<String>,
-    working: Option<String>,
-    since: Instant,
+    /// What the agent is doing and since when. `None` is an idle session, and there is no
+    /// moment to read off one.
+    working: Option<(String, Instant)>,
     offset: usize,
     follow: bool,
     tick: usize,
@@ -380,7 +378,6 @@ impl App {
             cursor: 0,
             queued: Vec::new(),
             working: None,
-            since: Instant::now(),
             offset: 0,
             follow: true,
             tick: 0,
@@ -389,13 +386,13 @@ impl App {
             tool: None,
         };
         let brand = Style::new().fg(BRAND);
-        app.transcript.push_ready(Line::styled(MARK[0], brand), None);
+        app.transcript.push_ready(Line::styled(MARK[0], brand), false);
         app.transcript.push_ready(
             Line::from(vec![
                 Span::styled(MARK[1], brand),
                 Span::raw(format!("  corpus v{}", env!("CARGO_PKG_VERSION"))),
             ]),
-            None,
+            false,
         );
         app.transcript.push_ready(
             Line::from(vec![
@@ -403,7 +400,7 @@ impl App {
                 Span::raw("  by "),
                 Span::styled(WORDMARK, Style::new().add_modifier(Modifier::BOLD)),
             ]),
-            None,
+            false,
         );
         app
     }
@@ -467,13 +464,13 @@ impl App {
                 // back rather than repeating the code a second time below it.
                 let at = match self.writing_at.take() {
                     Some(at) => {
-                        self.transcript.replace_line(at, running, Some(FLEX_SPAN));
+                        self.transcript.replace_line(at, running, true);
                         at
                     }
                     None => {
                         self.transcript.blank();
                         let at = self.transcript.entries.len();
-                        self.transcript.push_ready(running, Some(FLEX_SPAN));
+                        self.transcript.push_ready(running, true);
                         at
                     }
                 };
@@ -534,7 +531,7 @@ impl App {
             &tool.code,
             format!(" · ↑ {sent}{back} lines · {}", took(ms)),
         );
-        self.transcript.replace_line(tool.at, head, Some(FLEX_SPAN));
+        self.transcript.replace_line(tool.at, head, true);
         if !ok {
             for line in tool.code.lines() {
                 // A gutter mark on an empty line is a mark with nothing to point at.
@@ -550,8 +547,7 @@ impl App {
     }
 
     fn busy_with(&mut self, what: impl Into<String>) {
-        self.working = Some(what.into());
-        self.since = Instant::now();
+        self.working = Some((what.into(), Instant::now()));
     }
 
     fn on_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> Action {
@@ -654,12 +650,12 @@ impl App {
 
         let body = body.inner(Margin::new(1, 0));
         self.transcript.rewrap(body.width);
-        let working = self.working.as_ref().map(|what| {
+        let working = self.working.as_ref().map(|(what, since)| {
             Line::styled(
                 format!(
                     "{} {what} · {:.1}s",
                     PULSE[self.tick % PULSE.len()],
-                    self.since.elapsed().as_secs_f32()
+                    since.elapsed().as_secs_f32()
                 ),
                 Style::new().fg(ACCENT),
             )
@@ -740,11 +736,16 @@ pub async fn run(session: Box<dyn Session>, sink: Sink, opening: Opening) -> Res
     let mut app = App::new();
     app.model = model;
     let mut pulse = tokio::time::interval(Duration::from_millis(PULSE_MS));
+    // The ticks missed while the session sat idle are not owed to anybody: catching up on
+    // them would spin the mark through a burst the moment a turn starts.
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let outcome = loop {
         terminal.draw(|frame| app.draw(frame))?;
         tokio::select! {
-            _ = pulse.tick() => app.tick += 1,
+            // Only the mark beside a running turn animates, so an idle session waits for
+            // something to happen rather than redrawing four times a second forever.
+            _ = pulse.tick(), if app.busy() => app.tick += 1,
             Some(message) = msgs.recv() => {
                 let mut message = Some(message);
                 // Deltas arrive far faster than the eye: fold everything pending into
@@ -1221,7 +1222,7 @@ mod tests {
         };
 
         let mut step = Transcript::default();
-        step.push_ready(crowded(), Some(FLEX_SPAN));
+        step.push_ready(crowded(), true);
         step.rewrap(10);
         assert!(
             step.wrapped[0].spans[FLEX_SPAN].content.ends_with('…'),
@@ -1230,7 +1231,7 @@ mod tests {
         );
 
         let mut lockup = Transcript::default();
-        lockup.push_ready(crowded(), None);
+        lockup.push_ready(crowded(), false);
         lockup.rewrap(10);
         assert_eq!(
             lockup.wrapped[0].spans[FLEX_SPAN].content, "cccccccc",

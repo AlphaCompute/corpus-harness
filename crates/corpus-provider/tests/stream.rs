@@ -127,11 +127,7 @@ async fn the_wire_trace_keeps_what_the_stream_actually_carried() {
         .await
         .unwrap();
 
-    let trace: Vec<serde_json::Value> = std::fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+    let trace: Vec<serde_json::Value> = Jsonl::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
 
     assert!(

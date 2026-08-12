@@ -40,6 +40,9 @@ enum Frame {
     },
     HostRequest {
         req_id: String,
+        /// Which cell asked, empty when a thread the cell spawned did.
+        #[serde(default)]
+        cell: String,
         #[serde(rename = "fn")]
         func: String,
         args: Value,
@@ -222,11 +225,16 @@ impl Kernel {
             };
             match frame {
                 Frame::Stream { id: cell, text } if cell == id => on_stream(&text),
-                Frame::HostRequest { req_id, func, args } => {
+                Frame::HostRequest {
+                    req_id,
+                    cell,
+                    func,
+                    args,
+                } => {
                     // A thread an abandoned cell left running keeps asking, and its
-                    // requests are still answered — but the cell id the shim derives them
-                    // from is the one that may buy this cell more clock.
-                    let mine = req_id.split('#').next() == Some(id.as_str());
+                    // requests are still answered — but only the running cell's own calls
+                    // may buy it more clock.
+                    let mine = cell == id;
                     let reply = match host.call(&func, args).await {
                         Ok(value) => {
                             json!({ "type": "host_reply", "req_id": req_id, "ok": true, "value": value })

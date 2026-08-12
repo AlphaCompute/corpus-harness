@@ -380,15 +380,29 @@ impl Sink {
 async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
     let config = Config::from_env()?;
     let python = kernel_python(&config.kernel_dir, config.python.as_deref());
-    let kernel = Kernel::start(&python, &config.kernel_dir, Tools::NAMES)
-        .await
-        .context("could not start the python kernel; set CORPUS_PYTHON if python3 is elsewhere")?;
     let mut provider = config.provider(config.model.as_deref().unwrap_or_default());
+
+    // Spawning a python interpreter and asking what the provider serves are a few hundred
+    // milliseconds each and neither needs the other, so they are the same wait rather than
+    // two. The listing is only asked for when no model was named.
+    let (kernel, listed) = tokio::join!(
+        Kernel::start(&python, &config.kernel_dir, Tools::NAMES),
+        async {
+            match provider.model.is_empty() {
+                true => Some(provider.models().await),
+                false => None,
+            }
+        }
+    );
+    let kernel = kernel
+        .context("could not start the python kernel; set CORPUS_PYTHON if python3 is elsewhere")?;
+
     let mut window: u32 = config.window.unwrap_or(0);
-    if provider.model.is_empty() {
-        let first = provider
-            .models()
-            .await?
+    // What the listing already answered, so the lookup below does not ask a second time
+    // for something this has in hand.
+    let asked = listed.is_some();
+    if let Some(listed) = listed {
+        let first = listed?
             .into_iter()
             .next()
             .context("the provider lists no models; set CORPUS_MODEL to name one")?;
@@ -403,7 +417,7 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         // Asking for the listing is worth a percentage on screen, and never worth a
         // slower start: the readout fills itself in whenever the answer lands, and
         // plenty of providers state no window at all and never answer with one.
-        0 => {
+        0 if !asked => {
             let ask = config.provider(&model);
             let named = model.clone();
             tokio::spawn(async move {
@@ -415,6 +429,7 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
                 let _ = found.send(tokens);
             });
         }
+        // Zero here is a listing that was read and stated nothing: no share on screen.
         named => {
             let _ = found.send(named);
         }
@@ -426,7 +441,7 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
     let tools = Tools::new(config.provider(&model));
     let mut agent = Agent::new(provider, kernel, Arc::new(tools), SYSTEM_PROMPT, budget);
     if let Some(path) = resume {
-        agent.replay(read_log(path)?);
+        agent.replay(Jsonl::read::<Event>(path)?);
     }
     Ok((
         LocalSession::new(agent, model.clone()),
@@ -435,15 +450,6 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
             window: known,
         },
     ))
-}
-
-fn read_log(path: &Path) -> Result<Vec<Event>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read the session log at {}", path.display()))?;
-    Ok(text
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect())
 }
 
 /// One prompt, or a prompt at a time from stdin until it ends.

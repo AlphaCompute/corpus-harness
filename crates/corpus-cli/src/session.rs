@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// One turn of conversation, wherever the loop actually runs. The renderer holds this
-/// and cannot tell a local agent from one behind a pipe — that is the whole point (§8 Ш5).
+/// and cannot tell a local agent from one behind a pipe — that is the whole point.
 #[async_trait]
 pub trait Session: Send {
     async fn run(&mut self, prompt: &str, on_event: &mut (dyn FnMut(Event) + Send)) -> Result<()>;
@@ -75,7 +75,7 @@ impl Session for Local {
 
 /// The same session, on the other side of a pipe. No crypto and no framing beyond
 /// JSON lines: if this renders identically to [`Local`], the hosted mode can be added
-/// later without touching the loop (§1).
+/// later without touching the loop.
 pub struct Remote {
     child: Child,
     writes: mpsc::UnboundedSender<String>,

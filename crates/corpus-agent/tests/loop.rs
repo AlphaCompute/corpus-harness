@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use corpus_agent::{Agent, Budget, Event, Outcome};
 use corpus_kernel::{Host, Kernel};
 use corpus_provider::{Provider, StopReason};
-use corpus_testkit::{Endpoint, delta, finish, kernel_dir, runs_python, says, serve, sse};
+use corpus_testkit::{
+    Endpoint, delta, finish, kernel_dir, python_call, runs_python, says, serve, sse,
+};
 use serde_json::{Value, json};
 
 #[derive(Default)]
@@ -279,12 +281,7 @@ async fn an_interrupt_ends_the_turn_with_whatever_it_has() {
 
 #[tokio::test]
 async fn narration_next_to_a_tool_call_is_not_mistaken_for_an_answer() {
-    let call = json!({
-        "index": 0,
-        "id": "call_1",
-        "type": "function",
-        "function": { "name": "python", "arguments": json!({ "code": "print('one')" }).to_string() },
-    });
+    let call = python_call("call_1", "print('one')");
     let calling = sse(&[
         &delta(&format!(
             r#""content":"Let me look.","tool_calls":[{call}]"#

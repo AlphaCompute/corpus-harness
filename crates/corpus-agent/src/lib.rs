@@ -18,7 +18,7 @@ const RESUMED: &str = "\n\nThis session was resumed from a log. The interpreter 
     the variables, imports and `_` the transcript talks about no longer exist.";
 
 /// The session log. The model's context is derived from it, never stored beside it,
-/// which is what lets compaction drop tool output without losing the session (§4.1).
+/// which is what lets compaction drop tool output without losing the session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Event {
@@ -313,7 +313,7 @@ impl Agent {
             context = completion.usage.input;
 
             if completion.tool_calls.is_empty() {
-                // Text is the answer only when the model asked for nothing else (§6).
+                // Text is the answer only when the model asked for nothing else.
                 // Narration alongside a tool call is not an answer, however it reads.
                 answer = completion.text.clone();
                 self.messages
@@ -369,7 +369,7 @@ impl Agent {
             args: args.clone(),
         });
 
-        // A bad call is data the model can act on, never an exception that kills the turn (§9.8).
+        // A bad call is data the model can act on, never an exception that kills the turn.
         let refusal = if call.name != "python" {
             Some(format!(
                 "ERROR: no tool named `{}`. The only tool is `python`.",
@@ -432,7 +432,7 @@ impl Agent {
         Ok(result)
     }
 
-    /// Oldest tool output goes first: a page can be fetched again, a line of reasoning cannot (§6).
+    /// Oldest tool output goes first: a page can be fetched again, a line of reasoning cannot.
     fn compact(&mut self) -> usize {
         let mut total: usize = self.messages.iter().map(size).sum();
         if total <= self.budget.context_chars {

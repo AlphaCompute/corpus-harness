@@ -63,18 +63,19 @@ def _host_fn(name):
     counter = [0]
 
     def call(**kwargs):
-        # The shim mints no identifiers of its own (§4.1): req_id is derived from the
-        # cell id the host assigned, so it stays unique without a uuid dependency. The
-        # cell is what the main thread is running, and only calls from there are named
-        # after it: a thread the cell spawned outlives the cell that spawned it, and its
-        # calls must not pass for the cell's own progress.
+        # The shim mints no identifiers of its own: req_id is derived from the cell id the
+        # host assigned, so it stays unique without a uuid dependency. `cell` goes as its
+        # own field rather than leaving the host to read it back out of req_id, which would
+        # put the spelling of one identifier in two languages. The cell is what the main
+        # thread is running, and only calls from there carry it: a thread the cell spawned
+        # outlives the cell, and its calls must not pass for the cell's own progress.
         counter[0] += 1
         cell = _current_id if threading.current_thread() is threading.main_thread() else ""
         req_id = f"{cell}#{name}{counter[0]}"
         event = threading.Event()
         with _pending_lock:
             _pending[req_id] = [event, None]
-        _send(type="host_request", req_id=req_id, fn=name, args=kwargs)
+        _send(type="host_request", req_id=req_id, cell=cell, fn=name, args=kwargs)
         event.wait()
         with _pending_lock:
             reply = _pending.pop(req_id)[1]

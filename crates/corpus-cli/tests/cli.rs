@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use corpus_provider::Jsonl;
 use corpus_testkit::{Endpoint, kernel_dir, says, serve};
 use serde_json::Value;
 
@@ -42,16 +43,26 @@ async fn corpus(endpoint: &Endpoint, args: &[&str], env: &[(&str, &str)]) -> Out
 /// Identifiers and timestamps are minted per run, so a transcript is only comparable
 /// without them.
 fn transcript(log: &Path) -> Vec<Value> {
-    std::fs::read_to_string(log)
+    Jsonl::read::<Value>(log)
         .unwrap()
-        .lines()
-        .map(|line| {
-            let mut event: Value = serde_json::from_str(line).unwrap();
+        .into_iter()
+        .map(|mut event| {
             for key in ["session_id", "turn_id", "agent", "at"] {
                 event.as_object_mut().unwrap().remove(key);
             }
             event
         })
+        .collect()
+}
+
+/// Every `key` carried by the events of one `kind`, in the order the log holds them.
+/// `.concat()` puts a streamed field back together; a `Vec` keeps one event's value apart
+/// from the next one's.
+fn field(log: &Path, kind: &str, key: &str) -> Vec<String> {
+    transcript(log)
+        .iter()
+        .filter(|event| event["t"] == kind)
+        .map(|event| event[key].as_str().unwrap_or_default().to_string())
         .collect()
 }
 
@@ -151,11 +162,7 @@ async fn resume_continues_the_session_from_its_log() {
         second.contains("Paris."),
         "the earlier answer is missing: {second}"
     );
-    let answers: Vec<_> = transcript(&log)
-        .iter()
-        .filter(|e| e["t"] == "answer")
-        .map(|e| e["text"].as_str().unwrap().to_string())
-        .collect();
+    let answers = field(&log, "answer", "text");
     assert_eq!(
         answers,
         ["Paris.", "About 2.1 million."],
@@ -297,11 +304,7 @@ async fn the_kernel_writes_and_reads_documents() {
     )
     .await;
 
-    let printed: String = transcript(&log)
-        .iter()
-        .filter(|event| event["t"] == "tool_stream")
-        .map(|event| event["text"].as_str().unwrap_or_default().to_string())
-        .collect();
+    let printed = field(&log, "tool_stream", "text").concat();
     assert!(
         printed.contains("pdf says: Квартальный отчёт"),
         "the pdf did not read back: {printed}"
@@ -360,11 +363,7 @@ async fn a_report_is_markdown_handed_to_one_call() {
     )
     .await;
 
-    let printed: String = transcript(&log)
-        .iter()
-        .filter(|event| event["t"] == "tool_stream")
-        .map(|event| event["text"].as_str().unwrap_or_default().to_string())
-        .collect();
+    let printed = field(&log, "tool_stream", "text").concat();
     assert!(
         printed.contains("says: Квартальный отчёт Выручка выросла за квартал."),
         "the heading, the emphasis and the paragraph must survive: {printed}"
