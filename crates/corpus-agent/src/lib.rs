@@ -401,7 +401,7 @@ impl Agent {
             .kernel
             .exec(
                 python_code(&args).unwrap_or_default(),
-                self.host.as_ref(),
+                &self.host,
                 &mut |text| {
                     captured.push_str(text);
                     on_event(Event::ToolStream {

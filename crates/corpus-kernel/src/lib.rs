@@ -196,32 +196,58 @@ impl Kernel {
         Interrupter(self.writes.clone())
     }
 
+    /// Runs one cell. Host calls it makes are served on tasks of their own, so several can
+    /// be in flight at once and none of them blocks the frames the cell is still sending.
+    /// The tasks belong to this call: when it returns — finished, interrupted or killed —
+    /// they are dropped, and an answer bought for a cell that is no longer there is never
+    /// written back.
     pub async fn exec(
         &mut self,
         code: &str,
-        host: &dyn Host,
+        host: &Arc<dyn Host>,
         on_stream: &mut (dyn FnMut(&str) + Send),
         timeout: Duration,
     ) -> Result<ExecOutcome> {
         let id = uuid::Uuid::now_v7().to_string();
         self.send(&json!({ "type": "exec", "id": id, "code": code }))?;
 
+        let mut calls = tokio::task::JoinSet::new();
+        // How many of this cell's own calls are waiting on the host. The clock measures the
+        // cell's work, not the host's: a host call carries its own budget, and a cell that
+        // spent an hour waiting on three fetches was never the runaway this timeout is for.
+        let mut open = 0usize;
         let mut deadline = Instant::now() + timeout;
         let mut interrupted = false;
         loop {
-            let frame = match tokio::time::timeout_at(deadline, self.frames.recv()).await {
-                Err(_) if !interrupted => {
+            let frame = tokio::select! {
+                biased;
+                // Once the interrupt has gone out the grace period stands whatever is in
+                // flight, or a cell could buy itself another lifetime by asking for a page.
+                _ = tokio::time::sleep_until(deadline), if open == 0 || interrupted => {
+                    if interrupted {
+                        let _ = self.child.kill().await;
+                        bail!("kernel ignored the interrupt and was killed; restart it to continue");
+                    }
                     interrupted = true;
                     deadline = Instant::now() + KILL_GRACE;
                     self.send(&interrupt())?;
                     continue;
                 }
-                Err(_) => {
-                    let _ = self.child.kill().await;
-                    bail!("kernel ignored the interrupt and was killed; restart it to continue");
+                Some(served) = calls.join_next() => {
+                    let (mine, reply) = served.context("a host call panicked")?;
+                    self.send(&reply)?;
+                    if mine {
+                        open -= 1;
+                        if open == 0 && !interrupted {
+                            deadline = Instant::now() + timeout;
+                        }
+                    }
+                    continue;
                 }
-                Ok(None) => bail!("kernel died: {}", self.stderr_tail()),
-                Ok(Some(frame)) => frame,
+                frame = self.frames.recv() => match frame {
+                    Some(frame) => frame,
+                    None => bail!("kernel died: {}", self.stderr_tail()),
+                },
             };
             match frame {
                 Frame::Stream { id: cell, text } if cell == id => on_stream(&text),
@@ -235,23 +261,19 @@ impl Kernel {
                     // requests are still answered — but only the running cell's own calls
                     // may buy it more clock.
                     let mine = cell == id;
-                    let reply = match host.call(&func, args).await {
-                        Ok(value) => {
-                            json!({ "type": "host_reply", "req_id": req_id, "ok": true, "value": value })
-                        }
-                        Err(error) => {
-                            json!({ "type": "host_reply", "req_id": req_id, "ok": false, "error": error })
-                        }
-                    };
-                    self.send(&reply)?;
-                    // The clock measures the cell's own work, not the host's: a host call
-                    // carries its own budget, and a cell that spent an hour waiting on
-                    // three fetches was never the runaway this timeout is for. Once the
-                    // interrupt has gone out the grace period stands, or a cell could buy
-                    // itself another lifetime by asking for one more page.
-                    if !interrupted && mine {
-                        deadline = Instant::now() + timeout;
-                    }
+                    open += usize::from(mine);
+                    let host = host.clone();
+                    calls.spawn(async move {
+                        let reply = match host.call(&func, args).await {
+                            Ok(value) => {
+                                json!({ "type": "host_reply", "req_id": req_id, "ok": true, "value": value })
+                            }
+                            Err(error) => {
+                                json!({ "type": "host_reply", "req_id": req_id, "ok": false, "error": error })
+                            }
+                        };
+                        (mine, reply)
+                    });
                 }
                 Frame::Done {
                     id: cell,

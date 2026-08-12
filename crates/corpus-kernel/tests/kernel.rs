@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -30,6 +31,10 @@ async fn start() -> Kernel {
         .expect("kernel starts")
 }
 
+fn host(host: impl Host + 'static) -> Arc<dyn Host> {
+    Arc::new(host)
+}
+
 async fn run(kernel: &mut Kernel, code: &str) -> (ExecOutcome, String) {
     run_within(kernel, code, Duration::from_secs(10))
         .await
@@ -43,7 +48,7 @@ async fn run_within(
 ) -> anyhow::Result<(ExecOutcome, String)> {
     let mut out = String::new();
     let outcome = kernel
-        .exec(code, &Echo, &mut |text| out.push_str(text), timeout)
+        .exec(code, &host(Echo), &mut |text| out.push_str(text), timeout)
         .await?;
     Ok((outcome, out))
 }
@@ -115,7 +120,7 @@ async fn host_error_reaches_the_cell() {
     let outcome = kernel
         .exec(
             "try:\n    fetch_url(url='x')\nexcept HostError as e:\n    print('caught', e)",
-            &Refuse,
+            &host(Refuse),
             &mut |text| out.push_str(text),
             Duration::from_secs(10),
         )
@@ -136,7 +141,7 @@ async fn waiting_on_the_host_does_not_spend_the_cells_own_clock() {
     let outcome = kernel
         .exec(
             "for attempt in range(3):\n    fetch_url(url='slow')\nprint('survived')",
-            &Slow(Duration::from_millis(400)),
+            &host(Slow(Duration::from_millis(400))),
             &mut |text| out.push_str(text),
             Duration::from_millis(500),
         )
@@ -173,6 +178,94 @@ async fn a_thread_left_behind_cannot_hold_the_next_cells_clock_open() {
         "{}",
         wedged.traceback
     );
+}
+
+/// One call the cell's own budget could never cover. The budget is for Python that has
+/// run away, and a cell waiting on an answer is not running anything.
+#[tokio::test]
+async fn a_single_host_call_may_outlast_the_cells_whole_budget() {
+    let mut kernel = start().await;
+    let mut out = String::new();
+    let outcome = kernel
+        .exec(
+            "fetch_url(url='slow')\nprint('served')",
+            &host(Slow(Duration::from_millis(600))),
+            &mut |text| out.push_str(text),
+            Duration::from_millis(200),
+        )
+        .await
+        .expect("a cell waiting on the host is not a runaway cell");
+    assert!(outcome.ok, "{}", outcome.traceback);
+    assert_eq!(out, "served\n");
+}
+
+/// Two calls in flight at once. Served one after another they would never both arrive,
+/// and the barrier would hold the pair until the cell's budget ran out.
+#[tokio::test]
+async fn calls_in_flight_together_are_served_together() {
+    struct Pair(tokio::sync::Barrier);
+    #[async_trait]
+    impl Host for Pair {
+        async fn call(&self, _: &str, _: Value) -> Result<Value, String> {
+            self.0.wait().await;
+            Ok(json!("paired"))
+        }
+    }
+
+    let mut kernel = start().await;
+    let mut out = String::new();
+    let outcome = kernel
+        .exec(
+            "import threading\n\
+             answers = []\n\
+             asking = [threading.Thread(target=lambda: answers.append(fetch_url(url='x'))) for _ in range(2)]\n\
+             for thread in asking: thread.start()\n\
+             for thread in asking: thread.join()\n\
+             print(len(answers), answers[0])",
+            &host(Pair(tokio::sync::Barrier::new(2))),
+            &mut |text| out.push_str(text),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("the second call never reached the host");
+    assert!(outcome.ok, "{}", outcome.traceback);
+    assert_eq!(out, "2 paired\n");
+}
+
+/// Interrupting a cell mid-call is an ordinary gesture, so what it leaves behind is worth
+/// counting: the kernel keeps going, and the slot the call was waiting on is gone.
+#[tokio::test]
+async fn a_call_cut_short_leaves_no_slot_behind() {
+    let mut kernel = start().await;
+    let interrupter = kernel.interrupter();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        interrupter.raise();
+    });
+
+    let mut out = String::new();
+    let outcome = kernel
+        .exec(
+            "fetch_url(url='slow')",
+            &host(Slow(Duration::from_secs(30))),
+            &mut |text| out.push_str(text),
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("the kernel must outlive a call that was cut short");
+    assert!(!outcome.ok);
+    assert!(
+        outcome.traceback.contains("KeyboardInterrupt"),
+        "{}",
+        outcome.traceback
+    );
+
+    let (after, _) = run(
+        &mut kernel,
+        "import sys; len(sys.modules['__main__']._pending)",
+    )
+    .await;
+    assert_eq!(after.repr, "0", "the cut-short call left its slot behind");
 }
 
 #[tokio::test]

@@ -76,9 +76,14 @@ def _host_fn(name):
         with _pending_lock:
             _pending[req_id] = [event, None]
         _send(type="host_request", req_id=req_id, cell=cell, fn=name, args=kwargs)
-        event.wait()
-        with _pending_lock:
-            reply = _pending.pop(req_id)[1]
+        try:
+            event.wait()
+        finally:
+            # The wait is where an interrupt lands, and interrupting a cell mid-call is an
+            # ordinary gesture rather than a rarity: a slot left behind on every one of them
+            # is a leak that grows for as long as the kernel lives.
+            with _pending_lock:
+                reply = _pending.pop(req_id)[1]
         if not reply.get("ok"):
             raise HostError(reply.get("error", "host call failed"))
         return reply.get("value")
