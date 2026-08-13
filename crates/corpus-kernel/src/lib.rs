@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -123,18 +123,29 @@ pub struct Kernel {
 
 impl Kernel {
     /// `fns` are the names bound in the cell namespace; each one round-trips to [`Host::call`].
+    /// `skills` are the roots a cell imports a skill's package from, in the order they are
+    /// preferred: the caller decides where they are, the kernel only puts them on the path.
     pub async fn start(
         python: impl AsRef<OsStr>,
         kernel_dir: &Path,
+        skills: &[PathBuf],
         fns: &[&str],
     ) -> Result<Kernel> {
+        // Joining fails only when a directory contains the separator itself, and there is
+        // no value to fall back to then: python would split that same string in the same
+        // place. Said outright, because the symptom is a shim that cannot be imported.
+        let import_path = std::env::join_paths(
+            std::iter::once(kernel_dir.to_path_buf()).chain(skills.iter().cloned()),
+        )
+        .with_context(|| format!("{} cannot go on PYTHONPATH", kernel_dir.display()))?;
+
         let mut child = Command::new(python)
             .arg("-m")
             .arg("corpus_kernel")
             // The kernel runs model-written code: it gets no inherited secrets, ever.
             .env_clear()
             .envs(machine_env())
-            .env("PYTHONPATH", kernel_dir)
+            .env("PYTHONPATH", import_path)
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("PYTHONIOENCODING", "utf-8")

@@ -37,9 +37,15 @@ const PREVIEW: usize = 160;
 pub struct Recipe {
     pub python: String,
     pub kernel_dir: PathBuf,
+    /// The skills roots the session was started with, so a child imports the same packages
+    /// its parent's prompt describes rather than whatever the directory it ends up in has.
+    pub roots: Vec<PathBuf>,
     pub provider: Provider,
     pub budget: Budget,
     pub search: Option<Search>,
+    /// What the prompt says about the skills, as it was rendered for the session: a child
+    /// starts the same kernel off the same directory, so it sees the same ones.
+    pub skills: String,
 }
 
 /// Where a child is between turns. `running` is not a field: it is `busy || queued > 0`,
@@ -267,10 +273,12 @@ impl Children {
 fn leaf(recipe: &Recipe, id: Uuid) -> Agent {
     let python = recipe.python.clone();
     let kernel_dir = recipe.kernel_dir.clone();
+    let roots = recipe.roots.clone();
     let start = Kernels::new(move || {
         let python = python.clone();
         let kernel_dir = kernel_dir.clone();
-        async move { Kernel::start(&python, &kernel_dir, &Tools::names(false)).await }
+        let roots = roots.clone();
+        async move { Kernel::start(&python, &kernel_dir, &roots, &Tools::names(false)).await }
     });
     Agent::lazy(
         id,
@@ -281,7 +289,7 @@ fn leaf(recipe: &Recipe, id: Uuid) -> Agent {
             recipe.search.clone(),
             None,
         )),
-        &crate::system_prompt(Some(id)),
+        &crate::system_prompt(Some(id), &recipe.skills),
         recipe.budget,
     )
 }

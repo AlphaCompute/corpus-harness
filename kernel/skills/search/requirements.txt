@@ -1,0 +1,3 @@
+duckdb
+pymupdf
+python-docx

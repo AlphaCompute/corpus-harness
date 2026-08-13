@@ -481,9 +481,11 @@ mod tests {
         let recipe = crate::children::Recipe {
             python: "python3".into(),
             kernel_dir: corpus_testkit::kernel_dir(),
+            roots: corpus_testkit::skills(),
             provider: provider.clone(),
             budget: corpus_agent::Budget::default(),
             search: None,
+            skills: String::new(),
         };
         let tools = Tools::new(provider, None, Some(Children::new(recipe, root, told)));
         (tools, heard, root)

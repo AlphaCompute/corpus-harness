@@ -11,6 +11,12 @@ pub fn kernel_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel")
 }
 
+/// The skills the checkout ships with, as the roots a session would start a kernel on. A
+/// test wanting a skill of its own passes its own directory ahead of these.
+pub fn skills() -> Vec<std::path::PathBuf> {
+    vec![kernel_dir().join("skills")]
+}
+
 pub struct Endpoint {
     /// Hand this to `Provider::new`.
     pub url: String,

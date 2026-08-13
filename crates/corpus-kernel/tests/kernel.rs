@@ -26,9 +26,14 @@ impl Host for Slow {
 }
 
 async fn start() -> Kernel {
-    Kernel::start("python3", &kernel_dir(), &["fetch_url"])
-        .await
-        .expect("kernel starts")
+    Kernel::start(
+        "python3",
+        &kernel_dir(),
+        &corpus_testkit::skills(),
+        &["fetch_url"],
+    )
+    .await
+    .expect("kernel starts")
 }
 
 fn host(host: impl Host + 'static) -> Arc<dyn Host> {
@@ -385,7 +390,7 @@ async fn a_shell_command_reaches_the_model() {
     let mut kernel = start().await;
     let (outcome, out) = run(
         &mut kernel,
-        "import corpus_code\ncorpus_code.sh('echo built && echo broken >&2')",
+        "import shell\nshell.sh('echo built && echo broken >&2')",
     )
     .await;
     assert!(outcome.ok, "{}", outcome.traceback);
@@ -393,7 +398,7 @@ async fn a_shell_command_reaches_the_model() {
     assert!(out.contains("broken"), "stderr was swallowed: {out}");
     assert_eq!(outcome.repr, "0");
 
-    let (failed, out) = run(&mut kernel, "corpus_code.sh('exit 3')").await;
+    let (failed, out) = run(&mut kernel, "shell.sh('exit 3')").await;
     assert_eq!(failed.repr, "3");
     assert!(out.contains("[exit 3]"), "{out}");
 }
@@ -403,14 +408,14 @@ async fn an_edit_lands_once_or_not_at_all() {
     let mut kernel = start().await;
     let (outcome, out) = run(
         &mut kernel,
-        "import corpus_code, pathlib, tempfile\n\
+        "import shell, pathlib, tempfile\n\
          page = pathlib.Path(tempfile.mkdtemp()) / 'f.txt'\n\
          page.write_text('a\\nb\\na\\n')\n\
          try:\n\
-        \x20   corpus_code.edit(page, 'a', 'c')\n\
+        \x20   shell.edit(page, 'a', 'c')\n\
          except ValueError as refusal:\n\
         \x20   print('refused')\n\
-         corpus_code.edit(page, 'b', 'c')\n\
+         shell.edit(page, 'b', 'c')\n\
          print(page.read_text().replace('\\n', '|'))",
     )
     .await;

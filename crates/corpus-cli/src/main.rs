@@ -1,6 +1,7 @@
 mod children;
 mod host;
 mod session;
+mod skills;
 mod tui;
 
 use std::io::{IsTerminal, Write};
@@ -51,27 +52,12 @@ Work a step at a time: write the smallest cell that gets you further, read what 
 then write the next one against what you now know. The namespace persists, so a long job is \
 built in pieces that each get checked, rather than in one cell that has to be right the first \
 time and is debugged whole when it is not. When nothing is left to run, stop calling the tool \
-and answer: text written beside a call is not an answer, however it reads.
+and answer: text written beside a call is not an answer, however it reads.";
 
-Documents are libraries in that same interpreter rather than functions: `pypdf` reads a PDF, \
-`reportlab` writes one, `python-docx` reads and writes Word. For an ordinary report write \
-markdown and hand it over — `corpus_docs.pdf(text, \"report.pdf\")` sets a font that covers \
-every alphabet and lays out headings, lists and tables — rather than deriving the same layout \
-by hand. Reach for reportlab itself when the layout is the point, and `corpus_docs.blocks(text)` \
-gives you the same pieces to build on. There, set `fontName=corpus_docs.unicode_font()` for any \
-non-Latin alphabet: its built-in fonts are Latin-1, and without it the text is written as empty \
-boxes and nothing reports an error. Write what you produce to a file in the working directory \
-rather than into your answer; what happens to it after that is below.
-
-Code is work in that same interpreter. The cell starts in the directory corpus was run \
-from, so a project is read and written with `pathlib`, `corpus_code.sh(\"cargo test\")` runs \
-a command and prints what it writes as it goes, and `corpus_code.edit(path, old, new)` \
-replaces one exact occurrence and refuses when the text is missing or repeated. Run a \
-project through its own toolchain rather than importing it here: this interpreter is your \
-workbench, not the project's environment, and a test that passes in it has proved nothing \
-about the project. Read before you change, and check the change by running what the project \
-runs.
-
+/// The rest of it, after the skills this checkout happens to have. The prompt is in two
+/// pieces because what a session can do is a question of what is installed beside it, and
+/// the answer to that is written between them.
+const MATERIAL: &str = "\n
 Work with data in variables, not in your context: assign what a call returns and print a \
 slice of it rather than the whole thing, and `_` keeps the value of the last cell that ended \
 on one, including a value whose output was cut. Peek before you plan — `_[:2000]` shows you \
@@ -93,7 +79,8 @@ machine the person you are talking to is sitting at:
   send_user_file(path=..., caption=None)
 
 The working directory is yours for as long as this session lasts and no longer, and nobody \
-is looking into it. A file is delivered by sending it, never by saying where it is. Send each \
+is looking into it. What you produce is written to a file there rather than into your answer, \
+and a file is delivered by sending it, never by saying where it is. Send each \
 one the moment it is finished — a report the moment it is written, not at the end of the \
 whole errand — with a caption when the filename alone does not say what it is. Then say in \
 words what you sent and what is in it.";
@@ -140,18 +127,12 @@ and no agents of your own to send off, so the errand is yours to run."
 /// The prompt an agent works under: the same one for everybody, plus what is true of this
 /// one in particular. What it may do is the list of names its namespace was bound from,
 /// so the two are written from one place and cannot drift apart.
-pub fn system_prompt(child: Option<uuid::Uuid>) -> String {
+pub fn system_prompt(child: Option<uuid::Uuid>, skills: &str) -> String {
     match child {
-        None => format!("{SYSTEM_PROMPT}{DELIVERY}{DELEGATION}"),
-        Some(id) => format!("{SYSTEM_PROMPT}{}", belonging(id)),
+        None => format!("{SYSTEM_PROMPT}{skills}{MATERIAL}{DELIVERY}{DELEGATION}"),
+        Some(id) => format!("{SYSTEM_PROMPT}{skills}{MATERIAL}{}", belonging(id)),
     }
 }
-
-/// What the kernel needs for documents. They are packages in the interpreter, not host
-/// functions: laying out a PDF is computation, and computation belongs in the cell where
-/// the model can shape it. `corpus_docs` only spares it deriving the ordinary report from
-/// scratch every time; the pieces underneath stay reachable.
-const PACKAGES: [&str; 3] = ["pypdf", "reportlab", "python-docx"];
 
 #[derive(Parser)]
 #[command(
@@ -328,11 +309,11 @@ impl Config {
 /// gets a virtualenv of its own beside the shim, because the `python3` on PATH belongs to
 /// the system and installing into it is not ours to do. A kernel without the packages
 /// still starts: a session that cannot write a PDF beats no session at all.
-fn kernel_python(kernel_dir: &Path, configured: Option<&str>) -> String {
+fn kernel_python(kernel_dir: &Path, skills: &[PathBuf], configured: Option<&str>) -> String {
     if let Some(python) = configured {
         return python.to_string();
     }
-    match prepare(&kernel_dir.join(".venv")) {
+    match prepare(&kernel_dir.join(".venv"), skills) {
         Ok(python) => python.to_string_lossy().into_owned(),
         Err(error) => {
             eprintln!("kernel packages unavailable ({error:#}); documents will not work");
@@ -341,37 +322,102 @@ fn kernel_python(kernel_dir: &Path, configured: Option<&str>) -> String {
     }
 }
 
-/// ponytail: readiness is «the directory is there», so adding a package to `PACKAGES`
-/// means deleting `kernel/.venv` by hand. A stamp file naming the contents is the upgrade,
-/// and it is worth writing the day the list changes for the first time.
-fn prepare(venv: &Path) -> Result<PathBuf> {
+/// What the skills ask to be installed beside them, one to a line and in a fixed order.
+///
+/// ponytail: every root's asks go into the one environment beside the kernel, so working in
+/// a project whose own skills want a package rebuilds it, and working in the next one
+/// rebuilds it back. The ceiling is a person who keeps two such projects open; the upgrade
+/// is an environment per list rather than one beside the kernel.
+fn requirements(skills: &[PathBuf]) -> Vec<String> {
+    let mut wanted: Vec<String> = skills
+        .iter()
+        .flat_map(|root| std::fs::read_dir(root).into_iter().flatten().flatten())
+        .filter_map(|skill| std::fs::read_to_string(skill.path().join("requirements.txt")).ok())
+        .flat_map(|text| {
+            text.lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect::<Vec<String>>()
+        })
+        .collect();
+    wanted.sort();
+    // Two roots asking for the same package is one install, and one line in the record of
+    // what was installed, so the next run recognises what is already there.
+    wanted.dedup();
+    wanted
+}
+
+/// The name of what is installed, written inside the environment that holds it. Kept as
+/// the text rather than a digest of it: `DefaultHasher` is not stable between compilers, a
+/// digest crate is a dependency for comparing a few hundred bytes, and a file naming the
+/// packages outright is one a person can read when a session says they are missing.
+const INSTALLED: &str = "corpus-requirements";
+
+fn ready(venv: &Path, asked: &str) -> bool {
+    venv.join("bin/python3").exists()
+        && std::fs::read_to_string(venv.join(INSTALLED)).is_ok_and(|installed| installed == asked)
+}
+
+/// The interpreter that has them. Readiness is the list, not the directory: a package added
+/// to a skill is installed on the next run rather than whenever somebody thinks to delete
+/// the virtualenv by hand.
+fn prepare(venv: &Path, skills: &[PathBuf]) -> Result<PathBuf> {
     let python = venv.join("bin/python3");
-    if python.exists() {
+    let wanted = requirements(skills);
+    let asked = wanted.join("\n");
+    if ready(venv, &asked) {
         return Ok(python);
     }
     eprintln!("preparing the kernel's python in {} (once)", venv.display());
     // Built aside and moved in whole, so what a later run finds is never a half-installed
     // environment, and two runs racing here cannot interleave inside one directory.
     let staging = venv.with_file_name(format!(".venv.{}", std::process::id()));
-    let built = build(&staging);
-    if built.is_ok() {
+    let built = build(&staging, &wanted).and_then(|()| {
+        std::fs::write(staging.join(INSTALLED), &asked).context("cannot record what was installed")
+    });
+    // Asked again because installing takes long enough for another run to have finished the
+    // same work in the meantime, and what it left is as good as what this one built.
+    if built.is_ok() && !ready(venv, &asked) {
+        // ponytail: a session already running on the old environment loses it here, since
+        // the interpreter it spawned with imports its packages lazily. What closes that is a
+        // lock beside the virtualenv, and the day to take it out is the day two sessions
+        // wanting different skills are routinely started at once.
+        //
+        // Renaming onto a directory that already exists fails, so the old environment goes
+        // first, and its list goes before that: an interrupted removal then leaves a
+        // virtualenv that fails the check rather than one that passes it with its packages
+        // gone, which is the state nothing would ever rebuild out of.
+        let _ = std::fs::remove_file(venv.join(INSTALLED));
+        let _ = std::fs::remove_dir_all(venv);
         let _ = std::fs::rename(&staging, venv);
     }
     let _ = std::fs::remove_dir_all(&staging);
-    built?;
+    if let Err(error) = built {
+        // What is already there was installed for an older list, and it still writes
+        // documents: keeping it beats falling back to whatever python the system has.
+        if !python.exists() {
+            return Err(error);
+        }
+        eprintln!("could not install what the skills ask for ({error:#}); keeping what is there");
+    }
     python
         .exists()
         .then_some(python)
         .context("the virtualenv did not appear where it was put")
 }
 
-fn build(venv: &Path) -> Result<()> {
+fn build(venv: &Path, requirements: &[String]) -> Result<()> {
     run(std::process::Command::new("python3")
         .args(["-m", "venv"])
         .arg(venv))?;
+    // pip refuses a call that names nothing, and a checkout whose skills ask for nothing is
+    // a plain interpreter rather than a failure.
+    if requirements.is_empty() {
+        return Ok(());
+    }
     run(std::process::Command::new(venv.join("bin/python3"))
         .args(["-m", "pip", "install", "--quiet"])
-        .args(PACKAGES))
+        .args(requirements))
 }
 
 fn run(command: &mut std::process::Command) -> Result<()> {
@@ -518,20 +564,25 @@ impl Sink {
 /// window: it is a readout, not a prerequisite.
 async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
     let config = Config::from_env()?;
-    let python = kernel_python(&config.kernel_dir, config.python.as_deref());
+    let roots = skills::roots(&config.kernel_dir);
+    let python = kernel_python(&config.kernel_dir, &roots, config.python.as_deref());
     let mut provider = config.provider(config.model.as_deref().unwrap_or_default());
+    // Read once: the disk is not worth a second look per child.
+    let offered = skills::block(&skills::discover(&roots));
 
     // Spawning a python interpreter and asking what the provider serves are a few hundred
     // milliseconds each and neither needs the other, so they are the same wait rather than
     // two. The listing is only asked for when no model was named.
     let bound = Tools::names(true);
-    let (kernel, listed) =
-        tokio::join!(Kernel::start(&python, &config.kernel_dir, &bound), async {
+    let (kernel, listed) = tokio::join!(
+        Kernel::start(&python, &config.kernel_dir, &roots, &bound),
+        async {
             match provider.model.is_empty() {
                 true => Some(provider.models().await),
                 false => None,
             }
-        });
+        }
+    );
     let kernel = kernel
         .context("could not start the python kernel; set CORPUS_PYTHON if python3 is elsewhere")?;
 
@@ -580,9 +631,11 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
     let recipe = Recipe {
         python,
         kernel_dir: config.kernel_dir.clone(),
+        roots,
         provider: provider.clone(),
         budget,
         search: config.search.clone(),
+        skills: offered.clone(),
     };
     let tools = Tools::new(
         provider.clone(),
@@ -594,7 +647,7 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         provider,
         kernel,
         Arc::new(tools),
-        &system_prompt(None),
+        &system_prompt(None, &offered),
         budget,
     );
     if let Some(path) = resume {

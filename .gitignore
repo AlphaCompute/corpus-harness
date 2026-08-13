@@ -1,6 +1,10 @@
 /target
 .env
-.corpus/
+# What the agents write is theirs and nobody else's; the skills a project keeps beside them
+# are the project's, and belong in it. Listed as `/*` rather than the directory, because a
+# directory that is excluded outright cannot have anything re-included from inside it.
+.corpus/*
+!.corpus/skills/
 kernel/.venv
 __pycache__/
 .idea/

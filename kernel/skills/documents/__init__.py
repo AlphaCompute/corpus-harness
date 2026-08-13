@@ -42,6 +42,15 @@ def _bold_for(regular):
     return None
 
 
+def font_file():
+    """The first font file on this machine that covers non-Latin text, or None where
+    there is none. Reportlab is not the only library that needs telling: matplotlib
+    picks its own default, and a chart's labels go through the same alphabets a
+    document's headings do.
+    """
+    return next((path for path in CANDIDATES if path.exists()), None)
+
+
 def unicode_font(name="Unicode"):
     """Registers the first system font that covers non-Latin text and returns its name,
     for `fontName=` on a canvas or a paragraph style. `<b>` inside a paragraph picks up
@@ -55,24 +64,23 @@ def unicode_font(name="Unicode"):
 
     if name in pdfmetrics.getRegisteredFontNames():
         return name
-    for path in CANDIDATES:
-        if not path.exists():
-            continue
-        pdfmetrics.registerFont(TTFont(name, str(path)))
-        bold = _bold_for(path)
-        if bold is not None:
-            pdfmetrics.registerFont(TTFont(f"{name}-Bold", str(bold)))
-        # Mapped even where there is no bold file: an unmapped family sends `<b>` to
-        # Helvetica-Bold, which is Latin-1 and loses the alphabet this was chosen for.
-        weight = f"{name}-Bold" if bold is not None else name
-        pdfmetrics.registerFontFamily(
-            name, normal=name, bold=weight, italic=name, boldItalic=weight
+    path = font_file()
+    if path is None:
+        raise LookupError(
+            "no unicode font on this machine; register a .ttf yourself with "
+            "reportlab.pdfbase.pdfmetrics.registerFont(TTFont(name, path))"
         )
-        return name
-    raise LookupError(
-        "no unicode font on this machine; register a .ttf yourself with "
-        "reportlab.pdfbase.pdfmetrics.registerFont(TTFont(name, path))"
+    pdfmetrics.registerFont(TTFont(name, str(path)))
+    bold = _bold_for(path)
+    if bold is not None:
+        pdfmetrics.registerFont(TTFont(f"{name}-Bold", str(bold)))
+    # Mapped even where there is no bold file: an unmapped family sends `<b>` to
+    # Helvetica-Bold, which is Latin-1 and loses the alphabet this was chosen for.
+    weight = f"{name}-Bold" if bold is not None else name
+    pdfmetrics.registerFontFamily(
+        name, normal=name, bold=weight, italic=name, boldItalic=weight
     )
+    return name
 
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
@@ -88,7 +96,7 @@ def pdf(content, path="report.pdf", title=None):
     `content` is either text in the markdown subset `blocks` understands, or flowables
     to lay out as they are:
 
-        corpus_docs.pdf("# Отчёт\\n\\nПервый абзац.", "report.pdf")
+        documents.pdf("# Отчёт\\n\\nПервый абзац.", "report.pdf")
     """
     from reportlab.lib.pagesizes import A4
     from reportlab.platypus import SimpleDocTemplate, Spacer
