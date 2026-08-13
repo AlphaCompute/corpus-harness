@@ -1,49 +1,12 @@
 //! Agents a session sends off, over the whole path: the cell that spawns one, the child's
 //! own loop, and the answer coming back into the cell that asked for it.
 
-use std::path::{Path, PathBuf};
+mod common;
 
-use corpus_provider::Jsonl;
-use corpus_testkit::{Endpoint, kernel_dir, runs_python, says, serve};
+use corpus_testkit::{runs_python, says, serve};
 use serde_json::Value;
 
-const BIN: &str = env!("CARGO_BIN_EXE_corpus");
-
-fn workdir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-async fn corpus(endpoint: &Endpoint, prompt: &str, log: &Path) {
-    let output = tokio::process::Command::new(BIN)
-        .env("CORPUS_BASE_URL", &endpoint.url)
-        .env("CORPUS_API_KEY", "test-key")
-        .env("CORPUS_MODEL", "test-model")
-        .env("CORPUS_KERNEL_DIR", kernel_dir())
-        .args([prompt, "--log", log.to_str().unwrap()])
-        .output()
-        .await
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "corpus failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn events(log: &Path) -> Vec<Value> {
-    Jsonl::read::<Value>(log).unwrap()
-}
-
-fn printed(log: &Path) -> String {
-    events(log)
-        .iter()
-        .filter(|event| event["t"] == "tool_stream")
-        .map(|event| event["text"].as_str().unwrap_or_default().to_string())
-        .collect()
-}
+use common::{BIN, INTERRUPT_LINE, ask, command, events, printed, run_line, workdir};
 
 /// Ctrl-C stops the cell a person is watching, and nothing else. The agents that cell
 /// sent off keep working — killing them would throw away the very thing being waited on —
@@ -65,11 +28,7 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
     ])
     .await;
 
-    let mut child = tokio::process::Command::new(BIN)
-        .env("CORPUS_BASE_URL", &endpoint.url)
-        .env("CORPUS_API_KEY", "test-key")
-        .env("CORPUS_MODEL", "test-model")
-        .env("CORPUS_KERNEL_DIR", kernel_dir())
+    let mut child = command(&endpoint)
         .arg("serve")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -81,7 +40,7 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
 
     let session = async {
         stdin
-            .write_all(b"{\"cmd\":\"run\",\"text\":\"Send one off and wait.\"}\n")
+            .write_all(&run_line("Send one off and wait."))
             .await
             .unwrap();
         let mut stopped = false;
@@ -97,14 +56,14 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
                     .is_some_and(|text| text.contains("waiting"))
             {
                 stopped = true;
-                stdin.write_all(b"{\"cmd\":\"interrupt\"}\n").await.unwrap();
+                stdin.write_all(INTERRUPT_LINE).await.unwrap();
             }
             if event["t"] == "turn_end" {
                 break;
             }
         }
         stdin
-            .write_all(b"{\"cmd\":\"run\",\"text\":\"What have you got?\"}\n")
+            .write_all(&run_line("What have you got?"))
             .await
             .unwrap();
         while let Some(line) = lines.next_line().await.unwrap() {
@@ -149,11 +108,7 @@ async fn a_child_finishing_does_not_end_the_turn_a_client_is_reading() {
     ])
     .await;
 
-    let output = tokio::process::Command::new(BIN)
-        .env("CORPUS_BASE_URL", &endpoint.url)
-        .env("CORPUS_API_KEY", "test-key")
-        .env("CORPUS_MODEL", "test-model")
-        .env("CORPUS_KERNEL_DIR", kernel_dir())
+    let output = command(&endpoint)
         .args([
             "connect",
             "Send one off.",
@@ -215,7 +170,7 @@ async fn what_an_agent_spends_is_on_its_parents_bill_and_not_in_its_context() {
     ])
     .await;
 
-    corpus(&endpoint, "Read it through an agent.", &log).await;
+    ask(&endpoint, "Read it through an agent.", &log).await;
 
     let ended = events(&log)
         .into_iter()
@@ -251,11 +206,7 @@ async fn an_agent_coming_back_is_a_turn_the_session_takes_on_its_own() {
     ])
     .await;
 
-    let mut child = tokio::process::Command::new(BIN)
-        .env("CORPUS_BASE_URL", &endpoint.url)
-        .env("CORPUS_API_KEY", "test-key")
-        .env("CORPUS_MODEL", "test-model")
-        .env("CORPUS_KERNEL_DIR", kernel_dir())
+    let mut child = command(&endpoint)
         .arg("serve")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -267,7 +218,7 @@ async fn an_agent_coming_back_is_a_turn_the_session_takes_on_its_own() {
 
     let session = async {
         stdin
-            .write_all(b"{\"cmd\":\"run\",\"text\":\"Find the numbers.\"}\n")
+            .write_all(&run_line("Find the numbers."))
             .await
             .unwrap();
         let mut seen = Vec::new();
@@ -340,7 +291,7 @@ async fn a_cell_sends_an_agent_off_and_reads_what_it_answered() {
     ])
     .await;
 
-    corpus(&endpoint, "Read the second report.", &log).await;
+    ask(&endpoint, "Read the second report.", &log).await;
 
     let printed = printed(&log);
     assert!(
@@ -399,7 +350,7 @@ async fn more_work_for_a_busy_agent_waits_in_its_inbox() {
     ])
     .await;
 
-    corpus(&endpoint, "Count the tables in both.", &log).await;
+    ask(&endpoint, "Count the tables in both.", &log).await;
 
     let printed = printed(&log);
     assert!(
@@ -436,7 +387,7 @@ async fn a_child_cannot_send_off_a_child_of_its_own() {
     ])
     .await;
 
-    corpus(&endpoint, "What can the agent you send do?", &log).await;
+    ask(&endpoint, "What can the agent you send do?", &log).await;
 
     let printed = printed(&log);
     assert!(
@@ -465,12 +416,8 @@ async fn a_file_a_cell_produced_leaves_the_session_as_an_event() {
     ])
     .await;
 
-    let output = tokio::process::Command::new(BIN)
+    let output = command(&endpoint)
         .current_dir(&dir)
-        .env("CORPUS_BASE_URL", &endpoint.url)
-        .env("CORPUS_API_KEY", "test-key")
-        .env("CORPUS_MODEL", "test-model")
-        .env("CORPUS_KERNEL_DIR", kernel_dir())
         .args([
             "Write the report and send it.",
             "--log",

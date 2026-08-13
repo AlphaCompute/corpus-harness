@@ -480,7 +480,7 @@ impl Sink {
             // Off a line of its own, like the line that sent the agent off: this lands
             // whenever the agent comes back, which is as likely as not mid-sentence.
             Event::AgentEnd { ok, chars, .. } => {
-                println!("\n{} agent · {chars} chars", if *ok { "✓" } else { "✗" })
+                println!("\n{} agent · {chars} chars", tui::mark(*ok))
             }
             Event::MessageDelta { text, .. } => {
                 self.answered = true;
@@ -503,9 +503,7 @@ impl Sink {
                 println!("\n· {name}");
             }
             Event::ToolStream { text, .. } => print!("{text}"),
-            Event::ToolEnd { ok, summary, .. } => {
-                println!("{} {summary}", if *ok { "✓" } else { "✗" })
-            }
+            Event::ToolEnd { ok, summary, .. } => println!("{} {summary}", tui::mark(*ok)),
             Event::Compaction { dropped, .. } => println!("· compacted {dropped} tool results"),
             Event::TurnEnd { stop, usage, .. } => {
                 println!("\n· {stop:?} · {} in / {} out", usage.input, usage.output)
@@ -526,15 +524,14 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
     // Spawning a python interpreter and asking what the provider serves are a few hundred
     // milliseconds each and neither needs the other, so they are the same wait rather than
     // two. The listing is only asked for when no model was named.
-    let (kernel, listed) = tokio::join!(
-        Kernel::start(&python, &config.kernel_dir, Tools::names(true)),
-        async {
+    let bound = Tools::names(true);
+    let (kernel, listed) =
+        tokio::join!(Kernel::start(&python, &config.kernel_dir, &bound), async {
             match provider.model.is_empty() {
                 true => Some(provider.models().await),
                 false => None,
             }
-        }
-    );
+        });
     let kernel = kernel
         .context("could not start the python kernel; set CORPUS_PYTHON if python3 is elsewhere")?;
 

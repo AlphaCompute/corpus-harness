@@ -36,19 +36,23 @@ fn host(host: impl Host + 'static) -> Arc<dyn Host> {
 }
 
 async fn run(kernel: &mut Kernel, code: &str) -> (ExecOutcome, String) {
-    run_within(kernel, code, Duration::from_secs(10))
+    run_within(kernel, code, host(Echo), Duration::from_secs(10))
         .await
         .unwrap()
 }
 
+/// One cell, against whichever host and whichever clock the case is about. `exec` takes
+/// four arguments and collects what the cell printed; spelled here so no test spells it
+/// again.
 async fn run_within(
     kernel: &mut Kernel,
     code: &str,
+    host: Arc<dyn Host>,
     timeout: Duration,
 ) -> anyhow::Result<(ExecOutcome, String)> {
     let mut out = String::new();
     let outcome = kernel
-        .exec(code, &host(Echo), &mut |text| out.push_str(text), timeout)
+        .exec(code, &host, &mut |text| out.push_str(text), timeout)
         .await?;
     Ok((outcome, out))
 }
@@ -116,16 +120,14 @@ async fn host_error_reaches_the_cell() {
         }
     }
     let mut kernel = start().await;
-    let mut out = String::new();
-    let outcome = kernel
-        .exec(
-            "try:\n    fetch_url(url='x')\nexcept HostError as e:\n    print('caught', e)",
-            &host(Refuse),
-            &mut |text| out.push_str(text),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap();
+    let (outcome, out) = run_within(
+        &mut kernel,
+        "try:\n    fetch_url(url='x')\nexcept HostError as e:\n    print('caught', e)",
+        host(Refuse),
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
     assert!(outcome.ok, "{}", outcome.traceback);
     assert_eq!(out, "caught blocked by allowlist\n");
 }
@@ -137,16 +139,14 @@ async fn host_error_reaches_the_cell() {
 #[tokio::test]
 async fn waiting_on_the_host_does_not_spend_the_cells_own_clock() {
     let mut kernel = start().await;
-    let mut out = String::new();
-    let outcome = kernel
-        .exec(
-            "for attempt in range(3):\n    fetch_url(url='slow')\nprint('survived')",
-            &host(Slow(Duration::from_millis(400))),
-            &mut |text| out.push_str(text),
-            Duration::from_millis(500),
-        )
-        .await
-        .expect("the kernel must outlive a patient host");
+    let (outcome, out) = run_within(
+        &mut kernel,
+        "for attempt in range(3):\n    fetch_url(url='slow')\nprint('survived')",
+        host(Slow(Duration::from_millis(400))),
+        Duration::from_millis(500),
+    )
+    .await
+    .expect("the kernel must outlive a patient host");
     assert!(outcome.ok, "{}", outcome.traceback);
     assert_eq!(out, "survived\n");
 }
@@ -169,9 +169,14 @@ async fn a_thread_left_behind_cannot_hold_the_next_cells_clock_open() {
     .await;
     assert!(planted.ok, "{}", planted.traceback);
 
-    let (wedged, _) = run_within(&mut kernel, "while True: pass", Duration::from_millis(500))
-        .await
-        .unwrap();
+    let (wedged, _) = run_within(
+        &mut kernel,
+        "while True: pass",
+        host(Echo),
+        Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
     assert!(!wedged.ok, "a wedged cell outlived its budget");
     assert!(
         wedged.traceback.contains("KeyboardInterrupt"),
@@ -185,16 +190,14 @@ async fn a_thread_left_behind_cannot_hold_the_next_cells_clock_open() {
 #[tokio::test]
 async fn a_single_host_call_may_outlast_the_cells_whole_budget() {
     let mut kernel = start().await;
-    let mut out = String::new();
-    let outcome = kernel
-        .exec(
-            "fetch_url(url='slow')\nprint('served')",
-            &host(Slow(Duration::from_millis(600))),
-            &mut |text| out.push_str(text),
-            Duration::from_millis(200),
-        )
-        .await
-        .expect("a cell waiting on the host is not a runaway cell");
+    let (outcome, out) = run_within(
+        &mut kernel,
+        "fetch_url(url='slow')\nprint('served')",
+        host(Slow(Duration::from_millis(600))),
+        Duration::from_millis(200),
+    )
+    .await
+    .expect("a cell waiting on the host is not a runaway cell");
     assert!(outcome.ok, "{}", outcome.traceback);
     assert_eq!(out, "served\n");
 }
@@ -213,21 +216,19 @@ async fn calls_in_flight_together_are_served_together() {
     }
 
     let mut kernel = start().await;
-    let mut out = String::new();
-    let outcome = kernel
-        .exec(
+    let (outcome, out) = run_within(
+        &mut kernel,
             "import threading\n\
              answers = []\n\
              asking = [threading.Thread(target=lambda: answers.append(fetch_url(url='x'))) for _ in range(2)]\n\
              for thread in asking: thread.start()\n\
              for thread in asking: thread.join()\n\
              print(len(answers), answers[0])",
-            &host(Pair(tokio::sync::Barrier::new(2))),
-            &mut |text| out.push_str(text),
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("the second call never reached the host");
+        host(Pair(tokio::sync::Barrier::new(2))),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("the second call never reached the host");
     assert!(outcome.ok, "{}", outcome.traceback);
     assert_eq!(out, "2 paired\n");
 }
@@ -238,18 +239,16 @@ async fn calls_in_flight_together_are_served_together() {
 #[tokio::test]
 async fn an_answer_a_thread_is_waiting_on_outlives_the_cell_that_ended() {
     let mut kernel = start().await;
-    let mut out = String::new();
-    let outcome = kernel
-        .exec(
+    let (outcome, _) = run_within(
+        &mut kernel,
             "import threading\n\
              answers = []\n\
              threading.Thread(target=lambda: answers.append(fetch_url(url='late')), daemon=True).start()",
-            &host(Slow(Duration::from_millis(300))),
-            &mut |text| out.push_str(text),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap();
+        host(Slow(Duration::from_millis(300))),
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
     assert!(outcome.ok, "{}", outcome.traceback);
 
     let (after, _) = run(
@@ -275,16 +274,14 @@ async fn a_call_cut_short_leaves_no_slot_behind() {
         interrupter.raise();
     });
 
-    let mut out = String::new();
-    let outcome = kernel
-        .exec(
-            "fetch_url(url='slow')",
-            &host(Slow(Duration::from_secs(30))),
-            &mut |text| out.push_str(text),
-            Duration::from_secs(20),
-        )
-        .await
-        .expect("the kernel must outlive a call that was cut short");
+    let (outcome, _) = run_within(
+        &mut kernel,
+        "fetch_url(url='slow')",
+        host(Slow(Duration::from_secs(30))),
+        Duration::from_secs(20),
+    )
+    .await
+    .expect("the kernel must outlive a call that was cut short");
     assert!(!outcome.ok);
     assert!(
         outcome.traceback.contains("KeyboardInterrupt"),
@@ -303,9 +300,14 @@ async fn a_call_cut_short_leaves_no_slot_behind() {
 #[tokio::test]
 async fn interrupt_stops_the_cell_and_the_kernel_survives() {
     let mut kernel = start().await;
-    let (outcome, _) = run_within(&mut kernel, "while True: pass", Duration::from_millis(300))
-        .await
-        .unwrap();
+    let (outcome, _) = run_within(
+        &mut kernel,
+        "while True: pass",
+        host(Echo),
+        Duration::from_millis(300),
+    )
+    .await
+    .unwrap();
     assert!(!outcome.ok);
     assert!(
         outcome.traceback.contains("KeyboardInterrupt"),
@@ -323,6 +325,7 @@ async fn a_cell_that_ignores_the_interrupt_is_killed() {
     let err = run_within(
         &mut kernel,
         "import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nwhile True: pass",
+        host(Echo),
         Duration::from_millis(300),
     )
     .await
@@ -336,6 +339,7 @@ async fn a_dead_kernel_is_reported_not_hung() {
     let err = run_within(
         &mut kernel,
         "import os; os._exit(3)",
+        host(Echo),
         Duration::from_secs(5),
     )
     .await
@@ -430,6 +434,7 @@ async fn an_interrupt_from_outside_stops_a_running_cell() {
     let (outcome, _) = run_within(
         &mut kernel,
         "import time; time.sleep(30)",
+        host(Echo),
         Duration::from_secs(20),
     )
     .await

@@ -18,6 +18,8 @@ reqwest ={ version = "0.12", default-features = false, features = ["json", "http
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt-multi-thread", "time", "net", "io-std"] }
 uuid = { version = "1", features = ["v7", "serde"] }
-# Already in the graph under ratatui, so stamping the log costs nothing new. Its own
-# formatter is left out: that one pulls a proc-macro crate in, and `format!` is enough.
+# Already in the graph under ratatui, so stamping the log costs nothing new. The
+# `formatting` feature is left off because `Rfc3339` writes subseconds at whatever width
+# the value needs, and a log read by eye and by `sort` wants one fixed width. `format!`
+# against the accessors gives the fixed milliseconds instead.
 time = "0.3"

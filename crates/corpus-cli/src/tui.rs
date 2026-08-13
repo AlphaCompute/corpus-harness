@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc;
 
+use crate::host::ellipsize;
 use crate::session::{Prompt, Session, deliver};
 use crate::{MARK, Opening, Sink, WORDMARK};
 
@@ -60,14 +61,28 @@ fn preview(code: &str) -> String {
 /// there is no line in it worth picking out, only a beginning worth showing.
 pub fn one_line(text: &str) -> String {
     let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Threshold and kept count differ by the ellipsis, so a line that already fits in 64
+    // is left whole and a longer one still lands on 64 columns.
     match line.chars().count() > 64 {
         true => ellipsize(&line, 63),
         false => line,
     }
 }
 
-fn ellipsize(text: &str, keep: usize) -> String {
-    text.chars().take(keep).chain("…".chars()).collect()
+/// How a finished step reads at a glance. The glyph is what both renderers say, so it is
+/// said in one place; the colour is the window's alone.
+pub fn mark(ok: bool) -> &'static str {
+    match ok {
+        true => "✓",
+        false => "✗",
+    }
+}
+
+fn tone(ok: bool) -> Color {
+    match ok {
+        true => Color::Green,
+        false => Color::Red,
+    }
 }
 
 /// One step of the transcript, running or finished — a cell that ran or a child that was
@@ -319,20 +334,27 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     if text.len() <= width || text.chars().count() <= width {
         return vec![text.to_string()];
     }
-    let chars: Vec<char> = text.chars().collect();
+    // Walked as slices of the text rather than through a `Vec<char>` of the whole of it:
+    // an open entry is re-wrapped on every redraw, so that buffer would be rebuilt once
+    // per arriving token for rows that mostly cannot have changed.
     let mut out = Vec::new();
-    let mut start = 0;
-    while start < chars.len() {
-        let end = (start + width).min(chars.len());
-        let mut cut = end;
-        if end < chars.len()
-            && let Some(space) = chars[start..end].iter().rposition(|c| *c == ' ')
-            && space > 0
-        {
-            cut = start + space + 1;
-        }
-        out.push(chars[start..cut].iter().collect());
-        start = cut;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let end = rest
+            .char_indices()
+            .nth(width)
+            .map_or(rest.len(), |(at, _)| at);
+        // A space opening the row is not a break to take: it is indentation, and breaking
+        // on it would drop what the indentation means.
+        let cut = match end < rest.len() {
+            true => rest[..end]
+                .rfind(' ')
+                .filter(|at| *at > 0)
+                .map_or(end, |at| at + 1),
+            false => end,
+        };
+        out.push(rest[..cut].to_string());
+        rest = &rest[cut..];
     }
     out
 }
@@ -351,6 +373,7 @@ enum Action {
     Quit,
 }
 
+#[derive(Default)]
 struct App {
     model: String,
     /// Tokens the last turn sent, and how many the model takes at once. A window of zero
@@ -393,21 +416,8 @@ impl App {
     /// before the first prompt is typed.
     fn new() -> App {
         let mut app = App {
-            model: String::new(),
-            context: 0,
-            window: 0,
-            transcript: Transcript::default(),
-            input: Vec::new(),
-            cursor: 0,
-            queued: Vec::new(),
-            working: None,
-            offset: 0,
             follow: true,
-            tick: 0,
-            answer_at: None,
-            writing_at: None,
-            tool: None,
-            kids: std::collections::HashMap::new(),
+            ..App::default()
         };
         let brand = Style::new().fg(BRAND);
         app.transcript
@@ -476,14 +486,10 @@ impl App {
                 agent, ok, chars, ..
             } => {
                 let task = self.kids.get(&agent).cloned().unwrap_or_default();
-                let (mark, colour) = match ok {
-                    true => ("✓", Color::Green),
-                    false => ("✗", Color::Red),
-                };
                 self.transcript.push_ready(
                     step(
-                        mark,
-                        colour,
+                        mark(ok),
+                        tone(ok),
                         "agent",
                         one_line(&task),
                         format!(" · {chars} chars"),
@@ -593,13 +599,9 @@ impl App {
             0 => String::new(),
             lines => format!(" ↓ {lines}"),
         };
-        let (mark, colour) = match ok {
-            true => ("✓", Color::Green),
-            false => ("✗", Color::Red),
-        };
         let head = step(
-            mark,
-            colour,
+            mark(ok),
+            tone(ok),
             &tool.name,
             preview(&tool.code),
             format!(" · ↑ {sent}{back} lines · {}", took(ms)),

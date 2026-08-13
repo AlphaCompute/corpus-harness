@@ -56,6 +56,9 @@ pub struct Tools {
     /// Absent at a leaf, and that absence is the whole of the depth limit: what a cell
     /// can reach is the list of names its namespace was bound from.
     children: Option<Children>,
+    /// Shared by every search. `fetch_url` builds its own instead, because it pins the one
+    /// address it checked and that pin belongs to a single request.
+    http: reqwest::Client,
 }
 
 impl Tools {
@@ -66,25 +69,23 @@ impl Tools {
             llm,
             search,
             children,
+            // One client for every search this host runs, so a turn that searches several
+            // times pays for one TLS handshake rather than one per call.
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("http client"),
         }
     }
 
     /// The names a namespace is bound from, which is also what its agent is told it has.
-    pub fn names(delegating: bool) -> &'static [&'static str] {
-        // Built once: a namespace is bound from a borrowed list, and the two lists differ
-        // only by what a leaf may not do.
-        static WITH_CHILDREN: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-        match delegating {
-            false => Tools::LEAF,
-            true => WITH_CHILDREN.get_or_init(|| {
-                Tools::LEAF
-                    .iter()
-                    .copied()
-                    .chain(["send_user_file"])
-                    .chain(Children::NAMES)
-                    .collect()
-            }),
+    pub fn names(delegating: bool) -> Vec<&'static str> {
+        let mut names = Tools::LEAF.to_vec();
+        if delegating {
+            names.push("send_user_file");
+            names.extend(Children::NAMES);
         }
+        names
     }
 
     /// Hands a file the session produced to whoever the session is talking to. Only the
@@ -192,12 +193,9 @@ impl Tools {
             "refused: this host has no search configured (CORPUS_SEARCH_KEY); fetch_url still works",
         )?;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("http client: {e}"))?;
         let asked = count.to_string();
-        let response = client
+        let response = self
+            .http
             .get(&search.url)
             .query(&[("q", query), ("count", asked.as_str())])
             .header("accept", "application/json")
@@ -245,18 +243,29 @@ impl Tools {
 
         // Resolve once and connect to the literal address that was checked, so nothing
         // can change under us between the check and the connection.
-        let address = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|e| format!("refused: {host} does not resolve ({e})"))?
-            .find(|addr| is_global(addr.ip()))
-            .ok_or_else(|| format!("refused: {host} resolves only to non-public addresses"))?;
+        //
+        // A resolver we cannot reach is not the same as a name that does not exist. A host
+        // that puts us behind a proxy is entitled to give us no resolver at all — that is
+        // how it keeps this process off the network — and there the proxy does this very
+        // check against the address it dials. Refusing here would refuse every page on
+        // exactly the deployments that took the most care.
+        let address = match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(mut found) => {
+                Some(found.find(|addr| is_global(addr.ip())).ok_or_else(|| {
+                    format!("refused: {host} resolves only to non-public addresses")
+                })?)
+            }
+            Err(_) if proxied() => None,
+            Err(error) => return Err(format!("refused: {host} does not resolve ({error})")),
+        };
 
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve(&host, address)
-            .build()
-            .map_err(|e| format!("http client: {e}"))?;
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(address) = address {
+            builder = builder.resolve(&host, address);
+        }
+        let client = builder.build().map_err(|e| format!("http client: {e}"))?;
         let response = client
             .get(parsed.clone())
             .header("user-agent", "corpus/0.1")
@@ -324,6 +333,22 @@ fn cut(text: &str, limit: usize) -> String {
     }
 }
 
+/// Keep this many characters and say that the rest was dropped. Unconditional: callers
+/// that have worked out the room they have pass it straight in.
+pub fn ellipsize(text: &str, keep: usize) -> String {
+    text.chars().take(keep).chain("…".chars()).collect()
+}
+
+/// `ellipsize` for a preview a person reads rather than a limit a context has to fit: text
+/// already short enough is handed back untouched. `cut` is the one to reach for when the
+/// limit is in bytes.
+pub fn clip(text: &str, keep: usize) -> String {
+    match text.chars().count() > keep {
+        true => ellipsize(text, keep),
+        false => text.to_string(),
+    }
+}
+
 /// Fetched text is fenced field by field, and the fence says so in the text itself:
 /// whoever reads it downstream is told this is material for a report, not instructions.
 pub fn fence(source: &str, body: &str) -> String {
@@ -333,6 +358,28 @@ pub fn fence(source: &str, body: &str) -> String {
          {body}\n\
          END UNTRUSTED CONTENT>>>"
     )
+}
+
+/// The names `reqwest` reads a proxy from. Spelled here so this cannot disagree with the
+/// client about whether a request is about to go through one.
+const PROXY_VARS: [&str; 6] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+/// Whether something else is dialling on our behalf.
+fn proxied() -> bool {
+    proxy_named(|name| std::env::var(name).ok())
+}
+
+fn proxy_named(read: impl Fn(&str) -> Option<String>) -> bool {
+    PROXY_VARS
+        .iter()
+        .any(|name| read(name).is_some_and(|value| !value.trim().is_empty()))
 }
 
 fn is_global(ip: IpAddr) -> bool {
@@ -450,6 +497,24 @@ mod tests {
             "a leaf answers its parent, not the person who asked"
         );
         assert!(Tools::names(true).contains(&"send_user_file"));
+    }
+
+    /// A namespace is bound from one list and calls are dispatched from another, and there
+    /// is nothing but this to keep the two agreeing. A name bound with no arm behind it is
+    /// a function the agent is told it has and finds missing halfway through a session.
+    #[tokio::test]
+    async fn every_bound_name_reaches_a_host_function() {
+        let (tools, _heard, _root) = delivering();
+        for name in Tools::names(true) {
+            // Called with nothing, so most of these refuse on their arguments. What is
+            // being read is only whether dispatch found them at all.
+            if let Err(refusal) = tools.call(name, json!({})).await {
+                assert!(
+                    !refusal.contains("no host function named"),
+                    "`{name}` is bound in the namespace and dispatches to nothing"
+                );
+            }
+        }
     }
 
     /// One test for the whole of it, because every case turns on where the process is
@@ -639,6 +704,43 @@ mod tests {
             scrub("an ordinary sentence with numbers 12345"),
             "an ordinary sentence with numbers 12345"
         );
+    }
+
+    #[test]
+    fn a_proxy_is_noticed_under_every_name_it_is_written() {
+        for name in PROXY_VARS {
+            assert!(
+                proxy_named(|asked| (asked == name).then(|| "http://proxy:8888".into())),
+                "{name} names a proxy and was not read as one"
+            );
+        }
+        assert!(!proxy_named(|_| None), "no proxy is not a proxy");
+        assert!(
+            !proxy_named(|_| Some("  ".into())),
+            "an empty setting is how a deployment turns a proxy off"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_that_cannot_be_resolved_here_is_left_to_the_proxy() {
+        // A host that hands us no resolver is how it keeps this process off the network,
+        // and there the proxy runs this same check against the address it dials. Refusing
+        // on the lookup would refuse every page on exactly those deployments.
+        let refusal = batching("http://127.0.0.1:1")
+            .call(
+                "fetch_url",
+                json!({ "url": "https://nx.invalid.test/page" }),
+            )
+            .await
+            .expect_err("nothing is listening for this either way");
+        if proxied() {
+            assert!(
+                !refusal.contains("does not resolve"),
+                "a proxied fetch must reach the proxy before it can be refused: {refusal}"
+            );
+        } else {
+            assert!(refusal.contains("does not resolve"), "{refusal}");
+        }
     }
 
     #[test]

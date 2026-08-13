@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc, watch};
 use uuid::Uuid;
 
-use crate::host::{Search, Tools, fence};
+use crate::host::{Search, Tools, clip, fence};
 
 /// How many children may be taking a turn at once. The rest are not refused — a refusal
 /// would be one more thing for the model to handle — they wait their turn, so a hundred
@@ -48,8 +48,9 @@ pub struct Recipe {
 struct Status {
     busy: bool,
     queued: usize,
-    answer: Option<String>,
-    failed: Option<String>,
+    /// How the last finished turn went, or nothing at all if none has finished. One field
+    /// rather than two, so an answer and a failure cannot both be on record at once.
+    last: Option<Result<String, String>>,
 }
 
 impl Status {
@@ -177,20 +178,20 @@ impl Children {
                     parent,
                     ok: answered.is_ok(),
                     chars: answered.as_ref().map_or(0, |text| text.chars().count()),
-                    preview: opening(match &answered {
-                        Ok(text) => text,
-                        Err(why) => why,
-                    }),
+                    preview: clip(
+                        match &answered {
+                            Ok(text) => text,
+                            Err(why) => why,
+                        },
+                        PREVIEW,
+                    ),
                 });
                 // The latest turn is the answer, whichever way it went: an agent that
                 // worked once and broke since must not keep handing back what it said
                 // the first time.
                 status.send_modify(|state| {
                     state.busy = false;
-                    (state.answer, state.failed) = match answered {
-                        Ok(text) => (Some(text), None),
-                        Err(why) => (None, Some(why)),
-                    };
+                    state.last = Some(answered);
                 });
                 drop(permit);
             }
@@ -202,17 +203,17 @@ impl Children {
     async fn result(&self, id: Uuid, wait: Duration) -> Result<Value, String> {
         let mut status = self.watching(id)?;
         let settled = tokio::time::timeout(wait, status.wait_for(Status::settled)).await;
-        let (answer, failed) = match settled {
+        let last = match settled {
             Err(_) => return Ok(Value::Null),
             Ok(Err(_)) => return Err(format!("agent {id} is gone")),
-            Ok(Ok(state)) => (state.answer.clone(), state.failed.clone()),
+            Ok(Ok(state)) => state.last.clone(),
         };
-        match (answer, failed) {
+        match last {
             // A child reports on material it went and read, so what it says is material
             // too: the same fence a fetched page gets, for the same reason.
-            (Some(answer), _) => Ok(json!(fence(&format!("agent {id}"), &answer))),
-            (None, Some(why)) => Err(why),
-            (None, None) => Ok(Value::Null),
+            Some(Ok(answer)) => Ok(json!(fence(&format!("agent {id}"), &answer))),
+            Some(Err(why)) => Err(why),
+            None => Ok(Value::Null),
         }
     }
 
@@ -269,7 +270,7 @@ fn leaf(recipe: &Recipe, id: Uuid) -> Agent {
     let start = Kernels::new(move || {
         let python = python.clone();
         let kernel_dir = kernel_dir.clone();
-        async move { Kernel::start(&python, &kernel_dir, Tools::names(false)).await }
+        async move { Kernel::start(&python, &kernel_dir, &Tools::names(false)).await }
     });
     Agent::lazy(
         id,
@@ -317,13 +318,6 @@ pub fn doorbell(news: &[Event]) -> Option<String> {
         // Where the rest of an answer is kept is in the prompt, said once for the session
         // rather than again on every child that comes back.
         false => Some(fence("your agents", &lines.join("\n"))),
-    }
-}
-
-fn opening(text: &str) -> String {
-    match text.chars().count() > PREVIEW {
-        true => text.chars().take(PREVIEW).chain("…".chars()).collect(),
-        false => text.to_string(),
     }
 }
 

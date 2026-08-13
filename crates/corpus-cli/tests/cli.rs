@@ -1,70 +1,9 @@
-use std::path::{Path, PathBuf};
-use std::process::Output;
+mod common;
 
-use corpus_provider::Jsonl;
-use corpus_testkit::{Endpoint, kernel_dir, says, serve};
+use corpus_testkit::{says, serve};
 use serde_json::Value;
 
-const BIN: &str = env!("CARGO_BIN_EXE_corpus");
-
-fn workdir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// The binary under test, pointed at the scripted endpoint and the kernel in the tree.
-fn command(endpoint: &Endpoint) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(BIN);
-    command
-        .env("CORPUS_BASE_URL", &endpoint.url)
-        .env("CORPUS_API_KEY", "test-key")
-        .env("CORPUS_MODEL", "test-model")
-        .env("CORPUS_KERNEL_DIR", kernel_dir());
-    command
-}
-
-async fn corpus(endpoint: &Endpoint, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = command(endpoint);
-    command.args(args);
-    for (name, value) in env {
-        command.env(name, value);
-    }
-    let output = command.output().await.unwrap();
-    assert!(
-        output.status.success(),
-        "corpus {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-/// Identifiers and timestamps are minted per run, so a transcript is only comparable
-/// without them.
-fn transcript(log: &Path) -> Vec<Value> {
-    Jsonl::read::<Value>(log)
-        .unwrap()
-        .into_iter()
-        .map(|mut event| {
-            for key in ["session_id", "turn_id", "agent", "at"] {
-                event.as_object_mut().unwrap().remove(key);
-            }
-            event
-        })
-        .collect()
-}
-
-/// Every `key` carried by the events of one `kind`, in the order the log holds them.
-/// `.concat()` puts a streamed field back together; a `Vec` keeps one event's value apart
-/// from the next one's.
-fn field(log: &Path, kind: &str, key: &str) -> Vec<String> {
-    transcript(log)
-        .iter()
-        .filter(|event| event["t"] == kind)
-        .map(|event| event[key].as_str().unwrap_or_default().to_string())
-        .collect()
-}
+use common::{BIN, INTERRUPT_LINE, command, corpus, field, printed, run_line, transcript, workdir};
 
 #[tokio::test]
 async fn a_local_run_draws_the_stream_and_writes_the_log() {
@@ -221,16 +160,13 @@ async fn an_interrupt_travels_down_the_pipe() {
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
 
     let turn = async {
-        stdin
-            .write_all(b"{\"cmd\":\"run\",\"text\":\"go\"}\n")
-            .await
-            .unwrap();
+        stdin.write_all(&run_line("go")).await.unwrap();
         let mut sent = false;
         while let Some(line) = lines.next_line().await.unwrap() {
             let event: Value = serde_json::from_str(&line).unwrap();
             if event["t"] == "tool_stream" && !sent {
                 sent = true;
-                stdin.write_all(b"{\"cmd\":\"interrupt\"}\n").await.unwrap();
+                stdin.write_all(INTERRUPT_LINE).await.unwrap();
             }
             if event["t"] == "turn_end" {
                 return event["stop"].as_str().unwrap_or_default().to_string();
@@ -295,7 +231,7 @@ async fn a_cell_fans_a_batch_out_to_the_model() {
     )
     .await;
 
-    let printed = field(&log, "tool_stream", "text").concat();
+    let printed = printed(&log);
     assert!(
         printed.contains("3 | labelled|labelled|labelled"),
         "the batch did not come back into the cell: {printed}"
@@ -345,7 +281,7 @@ async fn the_kernel_writes_and_reads_documents() {
     )
     .await;
 
-    let printed = field(&log, "tool_stream", "text").concat();
+    let printed = printed(&log);
     assert!(
         printed.contains("pdf says: Квартальный отчёт"),
         "the pdf did not read back: {printed}"
@@ -404,7 +340,7 @@ async fn a_report_is_markdown_handed_to_one_call() {
     )
     .await;
 
-    let printed = field(&log, "tool_stream", "text").concat();
+    let printed = printed(&log);
     assert!(
         printed.contains("says: Квартальный отчёт Выручка выросла за квартал."),
         "the heading, the emphasis and the paragraph must survive: {printed}"

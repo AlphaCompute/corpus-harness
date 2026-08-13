@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 // Control tokens are stripped from the stream rather than sent as `stop` strings: this
 // gateway's engine mangles a streaming answer when `stop` is set, cutting the text
@@ -207,6 +207,31 @@ impl Serialize for Tool {
     }
 }
 
+/// One completion request, borrowing the conversation it asks about.
+#[derive(Serialize)]
+struct Request<'a> {
+    model: &'a str,
+    messages: &'a [Message],
+    stream: bool,
+    stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "<[Tool]>::is_empty")]
+    tools: &'a [Tool],
+}
+
+#[derive(Serialize, Clone, Copy)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+/// What the trace says about a request without repeating the request. Carried alongside
+/// the bytes because the bytes are no longer a tree that can be asked.
+#[derive(Clone, Copy)]
+struct Shape {
+    bytes: usize,
+    messages: usize,
+    tools: usize,
+}
+
 #[derive(Debug)]
 pub enum Delta<'a> {
     Text(&'a str),
@@ -369,18 +394,27 @@ impl Provider {
         tools: &[Tool],
         on_delta: &mut (dyn FnMut(Delta<'_>) + Send),
     ) -> Result<Completion> {
-        let mut body = Map::new();
-        body.insert("model".into(), json!(self.model));
-        body.insert("messages".into(), json!(messages));
-        body.insert("stream".into(), json!(true));
-        body.insert("stream_options".into(), json!({ "include_usage": true }));
-        if !tools.is_empty() {
-            body.insert("tools".into(), json!(tools));
-        }
-        let body = Value::Object(body);
+        // Written straight to the bytes that get posted, borrowing the conversation rather
+        // than copying it into a `Value` first. This runs once per step of every turn with
+        // the whole context in it, so a spare copy of it is a spare copy per step.
+        let body = serde_json::to_vec(&Request {
+            model: &self.model,
+            messages,
+            stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
+            tools,
+        })
+        .context("serializing the request")?;
+        let shape = Shape {
+            bytes: body.len(),
+            messages: messages.len(),
+            tools: tools.len(),
+        };
 
         for attempt in 0..ATTEMPTS {
-            match self.attempt(&body, on_delta).await {
+            match self.attempt(&body, shape, on_delta).await {
                 Ok(completion) => return Ok(completion),
                 Err(failure) if failure.retryable && attempt + 1 < ATTEMPTS => {
                     tokio::time::sleep(BACKOFF * 2u32.pow(attempt)).await;
@@ -393,7 +427,8 @@ impl Provider {
 
     async fn attempt(
         &self,
-        body: &Value,
+        body: &[u8],
+        shape: Shape,
         on_delta: &mut (dyn FnMut(Delta<'_>) + Send),
     ) -> Result<Completion, Failure> {
         let url = format!("{}/chat/completions", self.base_url);
@@ -403,16 +438,17 @@ impl Provider {
             trace.record(&json!({ "post": {
                 "url": url,
                 "model": self.model,
-                "bytes": body.to_string().len(),
-                "messages": body["messages"].as_array().map_or(0, Vec::len),
-                "tools": body["tools"].as_array().map_or(0, Vec::len),
+                "bytes": shape.bytes,
+                "messages": shape.messages,
+                "tools": shape.tools,
             }}));
         }
         let mut response = self
             .http
             .post(&url)
             .bearer_auth(&self.api_key)
-            .json(body)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_vec())
             .send()
             .await
             .map_err(Failure::transport)?;
