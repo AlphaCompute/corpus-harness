@@ -3,7 +3,9 @@ mod common;
 use corpus_testkit::{says, serve};
 use serde_json::Value;
 
-use common::{BIN, INTERRUPT_LINE, command, corpus, field, printed, run_line, transcript, workdir};
+use common::{
+    BIN, INTERRUPT_LINE, command, corpus, field, printed, run_line, served, transcript, workdir,
+};
 
 #[tokio::test]
 async fn a_local_run_draws_the_stream_and_writes_the_log() {
@@ -142,31 +144,23 @@ async fn a_session_behind_a_pipe_produces_the_same_transcript() {
 
 #[tokio::test]
 async fn an_interrupt_travels_down_the_pipe() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::AsyncWriteExt;
 
     let endpoint = serve(vec![corpus_testkit::runs_python(
         "call_1",
         "print('working')\nimport time\ntime.sleep(30)",
     )])
     .await;
-    let mut child = command(&endpoint)
-        .arg("serve")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut session = served(&endpoint);
 
     let turn = async {
-        stdin.write_all(&run_line("go")).await.unwrap();
+        session.stdin.write_all(&run_line("go")).await.unwrap();
         let mut sent = false;
-        while let Some(line) = lines.next_line().await.unwrap() {
+        while let Some(line) = session.lines.next_line().await.unwrap() {
             let event: Value = serde_json::from_str(&line).unwrap();
             if event["t"] == "tool_stream" && !sent {
                 sent = true;
-                stdin.write_all(INTERRUPT_LINE).await.unwrap();
+                session.stdin.write_all(INTERRUPT_LINE).await.unwrap();
             }
             if event["t"] == "turn_end" {
                 return event["stop"].as_str().unwrap_or_default().to_string();

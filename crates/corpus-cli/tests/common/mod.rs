@@ -61,6 +61,35 @@ pub async fn ask(endpoint: &Endpoint, prompt: &str, log: &Path) -> Output {
     corpus(endpoint, &[prompt, "--log", log.to_str().unwrap()], &[]).await
 }
 
+/// A served session with both pipes open. Dropping it kills the child, so a test that fails
+/// early does not leave one behind.
+pub struct Served {
+    _child: tokio::process::Child,
+    pub stdin: tokio::process::ChildStdin,
+    pub lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+}
+
+/// Starts `corpus serve` and hands back the two ends of its protocol. What each test does
+/// with them differs; getting here is what they all have in common.
+pub fn served(endpoint: &Endpoint) -> Served {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut child = command(endpoint)
+        .arg("serve")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    Served {
+        _child: child,
+        stdin,
+        lines,
+    }
+}
+
 /// A line of the protocol a served session reads on stdin. Built rather than spelled out,
 /// so a prompt with a quote in it does not have to be escaped by hand at the call site and
 /// cannot quietly stop being valid json.

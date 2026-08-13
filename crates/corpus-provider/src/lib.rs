@@ -223,15 +223,6 @@ struct StreamOptions {
     include_usage: bool,
 }
 
-/// What the trace says about a request without repeating the request. Carried alongside
-/// the bytes because the bytes are no longer a tree that can be asked.
-#[derive(Clone, Copy)]
-struct Shape {
-    bytes: usize,
-    messages: usize,
-    tools: usize,
-}
-
 #[derive(Debug)]
 pub enum Delta<'a> {
     Text(&'a str),
@@ -407,14 +398,12 @@ impl Provider {
             tools,
         })
         .context("serializing the request")?;
-        let shape = Shape {
-            bytes: body.len(),
-            messages: messages.len(),
-            tools: tools.len(),
-        };
 
         for attempt in 0..ATTEMPTS {
-            match self.attempt(&body, shape, on_delta).await {
+            match self
+                .attempt(&body, messages.len(), tools.len(), on_delta)
+                .await
+            {
                 Ok(completion) => return Ok(completion),
                 Err(failure) if failure.retryable && attempt + 1 < ATTEMPTS => {
                     tokio::time::sleep(BACKOFF * 2u32.pow(attempt)).await;
@@ -428,7 +417,8 @@ impl Provider {
     async fn attempt(
         &self,
         body: &[u8],
-        shape: Shape,
+        messages: usize,
+        tools: usize,
         on_delta: &mut (dyn FnMut(Delta<'_>) + Send),
     ) -> Result<Completion, Failure> {
         let url = format!("{}/chat/completions", self.base_url);
@@ -438,9 +428,9 @@ impl Provider {
             trace.record(&json!({ "post": {
                 "url": url,
                 "model": self.model,
-                "bytes": shape.bytes,
-                "messages": shape.messages,
-                "tools": shape.tools,
+                "bytes": body.len(),
+                "messages": messages,
+                "tools": tools,
             }}));
         }
         let mut response = self
@@ -794,7 +784,6 @@ impl Acc {
         if held.is_empty() {
             return;
         }
-        self.settled = true;
         if self.calls.is_empty() {
             self.text.push_str(&held);
             on_delta(Delta::Text(&held));

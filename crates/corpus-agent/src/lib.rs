@@ -203,7 +203,6 @@ pub fn python_code(args: &Value) -> Option<&str> {
 pub struct Outcome {
     pub text: String,
     pub stop: StopReason,
-    pub usage: Usage,
 }
 
 /// How to start an interpreter, for an agent that may never ask for one. An agent that
@@ -540,11 +539,7 @@ impl Agent {
             usage,
             context,
         });
-        Ok(Outcome {
-            text: answer,
-            stop,
-            usage,
-        })
+        Ok(Outcome { text: answer, stop })
     }
 
     async fn execute(

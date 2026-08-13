@@ -556,7 +556,7 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         // slower start: the readout fills itself in whenever the answer lands, and
         // plenty of providers state no window at all and never answer with one.
         0 if !asked => {
-            let ask = config.provider(&model);
+            let ask = provider.clone();
             let named = model.clone();
             tokio::spawn(async move {
                 let listed = ask.models().await.unwrap_or_default();
@@ -580,12 +580,12 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
     let recipe = Recipe {
         python,
         kernel_dir: config.kernel_dir.clone(),
-        provider: config.provider(&model),
+        provider: provider.clone(),
         budget,
         search: config.search.clone(),
     };
     let tools = Tools::new(
-        config.provider(&model),
+        provider.clone(),
         config.search.clone(),
         Some(Children::new(recipe, root, told)),
     );

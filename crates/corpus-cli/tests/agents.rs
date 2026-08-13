@@ -6,14 +6,14 @@ mod common;
 use corpus_testkit::{runs_python, says, serve};
 use serde_json::Value;
 
-use common::{BIN, INTERRUPT_LINE, ask, command, events, printed, run_line, workdir};
+use common::{BIN, INTERRUPT_LINE, ask, command, events, printed, run_line, served, workdir};
 
 /// Ctrl-C stops the cell a person is watching, and nothing else. The agents that cell
 /// sent off keep working — killing them would throw away the very thing being waited on —
 /// and the handles are still in the namespace on the other side of the interrupt.
 #[tokio::test]
 async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::AsyncWriteExt;
 
     let waiting = "kid = spawn('a job that takes a while')\n\
                    print('waiting')\n\
@@ -28,24 +28,17 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
     ])
     .await;
 
-    let mut child = command(&endpoint)
-        .arg("serve")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut served = served(&endpoint);
 
     let session = async {
-        stdin
+        served
+            .stdin
             .write_all(&run_line("Send one off and wait."))
             .await
             .unwrap();
         let mut stopped = false;
         let mut printed = String::new();
-        while let Some(line) = lines.next_line().await.unwrap() {
+        while let Some(line) = served.lines.next_line().await.unwrap() {
             let event: Value = serde_json::from_str(&line).unwrap();
             // The cell says when it has reached the wait, which is the only moment an
             // interrupt is testing anything.
@@ -56,17 +49,18 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
                     .is_some_and(|text| text.contains("waiting"))
             {
                 stopped = true;
-                stdin.write_all(INTERRUPT_LINE).await.unwrap();
+                served.stdin.write_all(INTERRUPT_LINE).await.unwrap();
             }
             if event["t"] == "turn_end" {
                 break;
             }
         }
-        stdin
+        served
+            .stdin
             .write_all(&run_line("What have you got?"))
             .await
             .unwrap();
-        while let Some(line) = lines.next_line().await.unwrap() {
+        while let Some(line) = served.lines.next_line().await.unwrap() {
             let event: Value = serde_json::from_str(&line).unwrap();
             if event["t"] == "tool_stream" {
                 printed.push_str(event["text"].as_str().unwrap_or_default());
@@ -145,7 +139,7 @@ async fn a_child_finishing_does_not_end_the_turn_a_client_is_reading() {
 /// An answer that cost tokens, so a session can be billed for what its agents spend.
 fn says_costing(text: &str, input: u32, output: u32) -> Vec<u8> {
     corpus_testkit::sse(&[
-        &corpus_testkit::delta(&format!(r#""content":{}"#, Value::String(text.to_string()))),
+        &corpus_testkit::content(text),
         &format!(
             r#"{{"choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{input},"completion_tokens":{output}}}}}"#
         ),
@@ -192,7 +186,7 @@ async fn what_an_agent_spends_is_on_its_parents_bill_and_not_in_its_context() {
 /// one `result()` away and would otherwise sit in the context for good.
 #[tokio::test]
 async fn an_agent_coming_back_is_a_turn_the_session_takes_on_its_own() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::AsyncWriteExt;
 
     let long = "The numbers are 3, 5 and 8, and here is a great deal more about them: ".repeat(6);
     let endpoint = serve(vec![
@@ -206,24 +200,17 @@ async fn an_agent_coming_back_is_a_turn_the_session_takes_on_its_own() {
     ])
     .await;
 
-    let mut child = command(&endpoint)
-        .arg("serve")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut served = served(&endpoint);
 
     let session = async {
-        stdin
+        served
+            .stdin
             .write_all(&run_line("Find the numbers."))
             .await
             .unwrap();
         let mut seen = Vec::new();
         let mut told = false;
-        while let Some(line) = lines.next_line().await.unwrap() {
+        while let Some(line) = served.lines.next_line().await.unwrap() {
             let event: Value = serde_json::from_str(&line).unwrap();
             // Every agent's turns are in this stream, the child's among them, so the end
             // being waited for is the end of the turn the news itself started.

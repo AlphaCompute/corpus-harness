@@ -393,15 +393,14 @@ fn is_global(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_multicast()
                 || v4.octets()[0] == 0
-                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
-                || (v4.octets()[0] == 169 && v4.octets()[1] == 254))
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
         }
         IpAddr::V6(v6) => {
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local())
         }
     }
 }

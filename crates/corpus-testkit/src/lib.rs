@@ -141,16 +141,18 @@ pub fn delta(fields: &str) -> String {
     format!(r#"{{"choices":[{{"index":0,"delta":{{{fields}}}}}]}}"#)
 }
 
+/// The delta that carries a piece of the answer.
+pub fn content(text: &str) -> String {
+    delta(&format!(r#""content":{}"#, quote(text)))
+}
+
 /// The empty delta that carries the reason a turn ended.
 pub fn finish(reason: &str) -> String {
     format!(r#"{{"choices":[{{"index":0,"delta":{{}},"finish_reason":"{reason}"}}]}}"#)
 }
 
 pub fn says(text: &str) -> Vec<u8> {
-    sse(&[
-        &delta(&format!(r#""content":{}"#, quote(text))),
-        &finish("stop"),
-    ])
+    sse(&[&content(text), &finish("stop")])
 }
 
 /// The `python(code)` call as it rides inside a delta. Take this one where the turn puts
