@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc, watch};
 use uuid::Uuid;
 
-use crate::host::{Search, Tools, clip, fence};
+use crate::host::{Search, Tools, ellipsize, fence};
 
 /// How many children may be taking a turn at once. The rest are not refused — a refusal
 /// would be one more thing for the model to handle — they wait their turn, so a hundred
@@ -184,7 +184,7 @@ impl Children {
                     parent,
                     ok: answered.is_ok(),
                     chars: answered.as_ref().map_or(0, |text| text.chars().count()),
-                    preview: clip(
+                    preview: ellipsize(
                         match &answered {
                             Ok(text) => text,
                             Err(why) => why,

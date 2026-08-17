@@ -125,8 +125,10 @@ and no agents of your own to send off, so the errand is yours to run."
 }
 
 /// The prompt an agent works under: the same one for everybody, plus what is true of this
-/// one in particular. What it may do is the list of names its namespace was bound from,
-/// so the two are written from one place and cannot drift apart.
+/// one in particular. The functions it names in prose and the names a namespace is bound
+/// from ([`Tools::names`]) are written apart and have to agree: a name the prompt promises
+/// and nothing binds is a function the agent goes looking for halfway through a session
+/// and does not find. The test below is what holds the two to each other.
 pub fn system_prompt(child: Option<uuid::Uuid>, skills: &str) -> String {
     match child {
         None => format!("{SYSTEM_PROMPT}{skills}{MATERIAL}{DELIVERY}{DELEGATION}"),
@@ -817,6 +819,44 @@ async fn main() -> Result<()> {
                 window,
             };
             start(Box::new(session), prompt, log.as_deref(), opening).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every name a namespace is bound from is written in the prompt as a call, and every
+    /// call the prompt offers is bound. `Tools::names` and the prose above are the two
+    /// lists, and there is nothing but this holding them together.
+    #[test]
+    fn the_prompt_offers_exactly_what_a_namespace_is_bound_from() {
+        let called = |name: &str| format!("{name}(");
+        let root = system_prompt(None, "");
+        for name in Tools::names(true) {
+            assert!(
+                root.contains(&called(name)),
+                "`{name}` is bound for a session and its prompt never mentions it"
+            );
+        }
+
+        let leaf = system_prompt(Some(uuid::Uuid::now_v7()), "");
+        for name in Tools::names(false) {
+            assert!(
+                leaf.contains(&called(name)),
+                "`{name}` is bound for a child and its prompt never mentions it"
+            );
+        }
+        // And the other way, because a leaf that reads about delegating will try to.
+        for name in Tools::names(true) {
+            if Tools::names(false).contains(&name) {
+                continue;
+            }
+            assert!(
+                !leaf.contains(&called(name)),
+                "`{name}` is not bound for a child and its prompt offers it anyway"
+            );
         }
     }
 }

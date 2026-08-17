@@ -333,18 +333,11 @@ fn cut(text: &str, limit: usize) -> String {
     }
 }
 
-/// Keep this many characters and say that the rest was dropped. Unconditional: callers
-/// that have worked out the room they have pass it straight in.
+/// Keep this many characters and say that the rest was dropped; text that already fits is
+/// handed back untouched. `cut` is the one to reach for when the limit is in bytes.
 pub fn ellipsize(text: &str, keep: usize) -> String {
-    text.chars().take(keep).chain("…".chars()).collect()
-}
-
-/// `ellipsize` for a preview a person reads rather than a limit a context has to fit: text
-/// already short enough is handed back untouched. `cut` is the one to reach for when the
-/// limit is in bytes.
-pub fn clip(text: &str, keep: usize) -> String {
     match text.chars().count() > keep {
-        true => ellipsize(text, keep),
+        true => text.chars().take(keep).chain("…".chars()).collect(),
         false => text.to_string(),
     }
 }

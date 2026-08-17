@@ -821,12 +821,11 @@ pub async fn run(session: Box<dyn Session>, sink: Sink, opening: Opening) -> Res
             // Only the mark beside a running turn animates, so an idle session waits for
             // something to happen rather than redrawing four times a second forever.
             _ = pulse.tick(), if app.busy() => app.tick += 1,
-            Some(message) = msgs.recv() => {
-                let mut message = Some(message);
+            Some(mut message) = msgs.recv() => {
                 // Deltas arrive far faster than the eye: fold everything pending into
                 // one redraw instead of one frame per token.
-                while let Some(current) = message.take() {
-                    match current {
+                loop {
+                    match message {
                         Msg::Event(event) => app.on_event(event),
                         Msg::Window(tokens) => app.window = tokens,
                         Msg::TurnDone => {
@@ -842,7 +841,8 @@ pub async fn run(session: Box<dyn Session>, sink: Sink, opening: Opening) -> Res
                             app.transcript.line(0, Style::new().fg(Color::Red), error);
                         }
                     }
-                    message = msgs.try_recv().ok();
+                    let Ok(pending) = msgs.try_recv() else { break };
+                    message = pending;
                 }
             }
             Some(event) = keys.recv() => {
