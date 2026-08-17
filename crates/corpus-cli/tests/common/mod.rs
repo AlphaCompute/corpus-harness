@@ -39,14 +39,17 @@ pub fn command(endpoint: &Endpoint) -> tokio::process::Command {
     command
 }
 
-/// Runs to completion and insists the process was happy, because a test reading the log of
-/// a run that crashed reads an empty file and says something confusing about it.
-pub async fn corpus(endpoint: &Endpoint, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = command(endpoint);
-    command.args(args);
-    for (name, value) in env {
-        command.env(name, value);
-    }
+/// Runs a command the caller has already configured and insists the process was happy,
+/// because a test reading the log of a run that crashed reads an empty file and says
+/// something confusing about it. Separate from [`corpus`] for the tests that need a
+/// working directory or a `HOME` of their own, which is not something an argument list
+/// can carry.
+pub async fn succeeds(command: &mut tokio::process::Command) -> Output {
+    let args: Vec<String> = command
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     let output = command.output().await.unwrap();
     assert!(
         output.status.success(),
@@ -54,6 +57,16 @@ pub async fn corpus(endpoint: &Endpoint, args: &[&str], env: &[(&str, &str)]) ->
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+/// Runs to completion and insists the process was happy.
+pub async fn corpus(endpoint: &Endpoint, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = command(endpoint);
+    command.args(args);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    succeeds(&mut command).await
 }
 
 /// One prompt, logged where the test can read it: the shape most of these tests want.
@@ -93,13 +106,68 @@ pub fn served(endpoint: &Endpoint) -> Served {
 /// A line of the protocol a served session reads on stdin. Built rather than spelled out,
 /// so a prompt with a quote in it does not have to be escaped by hand at the call site and
 /// cannot quietly stop being valid json.
-pub fn run_line(text: &str) -> Vec<u8> {
+fn run_line(text: &str) -> Vec<u8> {
     let mut line = serde_json::json!({ "cmd": "run", "text": text }).to_string();
     line.push('\n');
     line.into_bytes()
 }
 
-pub const INTERRUPT_LINE: &[u8] = b"{\"cmd\":\"interrupt\"}\n";
+const INTERRUPT_LINE: &[u8] = b"{\"cmd\":\"interrupt\"}\n";
+
+/// The longest a served turn may take before the test gives up. A test that hangs on the
+/// pipe says nothing at all about why it hung.
+const TURN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a test wants done about the event it was just handed.
+pub enum Step {
+    /// Keep reading.
+    Go,
+    /// Send an interrupt down the pipe, then keep reading.
+    Interrupt,
+    /// The event this turn was being read for.
+    Stop,
+}
+
+impl Served {
+    /// One turn, as a client reads it: the prompt goes down the pipe, every event that
+    /// comes back is handed to `read`, and what it says to do about each one is what
+    /// happens. Gives back the events it read, the one it stopped on last.
+    ///
+    /// Which ending to stop on is the caller's, and never simply the first: every agent
+    /// over there shares this one pipe, so a child finishing crosses it too. The served
+    /// client reads the same shape for the same reason — see `Remote::pump`.
+    pub async fn turn(&mut self, prompt: &str, read: impl FnMut(&Value) -> Step) -> Vec<Value> {
+        tokio::time::timeout(TURN, self.follow(prompt, read))
+            .await
+            .expect("the served session never finished the turn")
+    }
+
+    async fn follow(&mut self, prompt: &str, mut read: impl FnMut(&Value) -> Step) -> Vec<Value> {
+        use tokio::io::AsyncWriteExt;
+
+        self.stdin.write_all(&run_line(prompt)).await.unwrap();
+        let mut seen = Vec::new();
+        while let Some(line) = self.lines.next_line().await.unwrap() {
+            let event: Value = serde_json::from_str(&line).unwrap();
+            let step = read(&event);
+            seen.push(event);
+            match step {
+                Step::Interrupt => self.stdin.write_all(INTERRUPT_LINE).await.unwrap(),
+                Step::Stop => return seen,
+                Step::Go => {}
+            }
+        }
+        panic!("the served session ended without finishing the turn");
+    }
+}
+
+/// Whether this is the end of a turn, which is where most of these tests stop reading.
+pub fn ends_turn(event: &Value) -> Step {
+    match event["t"] == "turn_end" {
+        true => Step::Stop,
+        false => Step::Go,
+    }
+}
 
 /// The log as it was written.
 pub fn events(log: &Path) -> Vec<Value> {

@@ -23,15 +23,20 @@ impl Host for Recorder {
     }
 }
 
-async fn agent(endpoint: &Endpoint, host: Arc<Recorder>, budget: Budget) -> Agent {
-    let kernel = Kernel::start(
+/// The interpreter these tests run cells in: this checkout's shim, this checkout's skills,
+/// and the one host name any of them calls.
+async fn interpreter() -> anyhow::Result<Kernel> {
+    Kernel::start(
         "python3",
         &kernel_dir(),
         &corpus_testkit::skills(),
         &["web_search"],
     )
     .await
-    .unwrap();
+}
+
+async fn agent(endpoint: &Endpoint, host: Arc<Recorder>, budget: Budget) -> Agent {
+    let kernel = interpreter().await.unwrap();
     Agent::new(
         uuid::Uuid::now_v7(),
         Provider::new(&endpoint.url, "test-key", "test-model"),
@@ -66,15 +71,7 @@ async fn an_interpreter_is_started_by_the_first_cell_and_not_before() {
     let counted = started.clone();
     let start = corpus_agent::Kernels::new(move || {
         counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        async {
-            Kernel::start(
-                "python3",
-                &kernel_dir(),
-                &corpus_testkit::skills(),
-                &["web_search"],
-            )
-            .await
-        }
+        interpreter()
     });
     let mut agent = Agent::lazy(
         uuid::Uuid::now_v7(),

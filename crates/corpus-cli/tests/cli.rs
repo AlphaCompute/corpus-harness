@@ -1,10 +1,10 @@
 mod common;
 
 use corpus_testkit::{kernel_dir, says, serve};
-use serde_json::Value;
 
 use common::{
-    BIN, INTERRUPT_LINE, command, corpus, field, printed, run_line, served, transcript, workdir,
+    BIN, Step, ask, command, corpus, ends_turn, field, printed, served, succeeds, transcript,
+    workdir,
 };
 
 #[tokio::test]
@@ -13,12 +13,7 @@ async fn a_local_run_draws_the_stream_and_writes_the_log() {
     let log = dir.join("session.jsonl");
     let endpoint = serve(vec![says("Paris.")]).await;
 
-    let output = corpus(
-        &endpoint,
-        &["Capital of France?", "--log", log.to_str().unwrap()],
-        &[],
-    )
-    .await;
+    let output = ask(&endpoint, "Capital of France?", &log).await;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -86,7 +81,7 @@ async fn resume_continues_the_session_from_its_log() {
     let endpoint = serve(vec![says("Paris."), says("About 2.1 million.")]).await;
     let log_arg = log.to_str().unwrap();
 
-    corpus(&endpoint, &["Capital of France?", "--log", log_arg], &[]).await;
+    ask(&endpoint, "Capital of France?", &log).await;
     corpus(
         &endpoint,
         &["And how many people live there?", "--resume", log_arg],
@@ -118,12 +113,7 @@ async fn a_session_behind_a_pipe_produces_the_same_transcript() {
     let there = dir.join("remote.jsonl");
     let endpoint = serve(vec![says("Paris."), says("Paris.")]).await;
 
-    corpus(
-        &endpoint,
-        &["Capital of France?", "--log", here.to_str().unwrap()],
-        &[],
-    )
-    .await;
+    ask(&endpoint, "Capital of France?", &here).await;
     corpus(
         &endpoint,
         &[
@@ -144,35 +134,26 @@ async fn a_session_behind_a_pipe_produces_the_same_transcript() {
 
 #[tokio::test]
 async fn an_interrupt_travels_down_the_pipe() {
-    use tokio::io::AsyncWriteExt;
-
     let endpoint = serve(vec![corpus_testkit::runs_python(
         "call_1",
         "print('working')\nimport time\ntime.sleep(30)",
     )])
     .await;
+
+    // The cell has to have reached the interpreter before an interrupt is testing anything.
     let mut session = served(&endpoint);
-
-    let turn = async {
-        session.stdin.write_all(&run_line("go")).await.unwrap();
-        let mut sent = false;
-        while let Some(line) = session.lines.next_line().await.unwrap() {
-            let event: Value = serde_json::from_str(&line).unwrap();
-            if event["t"] == "tool_stream" && !sent {
+    let mut sent = false;
+    let seen = session
+        .turn("go", |event| match event["t"] == "tool_stream" && !sent {
+            true => {
                 sent = true;
-                session.stdin.write_all(INTERRUPT_LINE).await.unwrap();
+                Step::Interrupt
             }
-            if event["t"] == "turn_end" {
-                return event["stop"].as_str().unwrap_or_default().to_string();
-            }
-        }
-        String::from("the served session ended without a turn_end")
-    };
+            false => ends_turn(event),
+        })
+        .await;
 
-    let stop = tokio::time::timeout(std::time::Duration::from_secs(30), turn)
-        .await
-        .expect("the interrupt never reached the running cell");
-    assert_eq!(stop, "partial");
+    assert_eq!(seen.last().unwrap()["stop"], "partial");
 }
 
 #[tokio::test]
@@ -218,12 +199,7 @@ async fn a_cell_fans_a_batch_out_to_the_model() {
     ])
     .await;
 
-    corpus(
-        &endpoint,
-        &["Label these.", "--log", log.to_str().unwrap()],
-        &[],
-    )
-    .await;
+    ask(&endpoint, "Label these.", &log).await;
 
     let printed = printed(&log);
     assert!(
@@ -268,12 +244,7 @@ async fn the_kernel_writes_and_reads_documents() {
     ])
     .await;
 
-    corpus(
-        &endpoint,
-        &["Write the report.", "--log", log.to_str().unwrap()],
-        &[],
-    )
-    .await;
+    ask(&endpoint, "Write the report.", &log).await;
 
     let printed = printed(&log);
     assert!(
@@ -327,12 +298,7 @@ async fn a_report_is_markdown_handed_to_one_call() {
     ])
     .await;
 
-    corpus(
-        &endpoint,
-        &["Write the report.", "--log", log.to_str().unwrap()],
-        &[],
-    )
-    .await;
+    ask(&endpoint, "Write the report.", &log).await;
 
     let printed = printed(&log);
     assert!(
@@ -369,12 +335,7 @@ async fn what_the_prompt_does_not_say_is_at_a_path_a_cell_can_open() {
     ])
     .await;
 
-    corpus(
-        &endpoint,
-        &["Write a report.", "--log", log.to_str().unwrap()],
-        &[],
-    )
-    .await;
+    ask(&endpoint, "Write a report.", &log).await;
 
     let prompt = &endpoint.requests()[0];
     for skill in ["shell", "documents"] {
@@ -433,12 +394,7 @@ async fn the_kernel_cuts_a_deck_and_searches_a_folder() {
     ])
     .await;
 
-    corpus(
-        &endpoint,
-        &["Cut a deck.", "--log", log.to_str().unwrap()],
-        &[],
-    )
-    .await;
+    ask(&endpoint, "Cut a deck.", &log).await;
 
     let printed = printed(&log);
     assert!(
@@ -499,12 +455,7 @@ print('berth:', tariffs.berth(4))\n";
         "--log",
         log.to_str().unwrap(),
     ]);
-    let output = first.output().await.unwrap();
-    assert!(
-        output.status.success(),
-        "corpus failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    succeeds(&mut first).await;
 
     let printed = printed(&log);
     assert!(
@@ -517,7 +468,7 @@ print('berth:', tariffs.berth(4))\n";
     next.current_dir(&dir)
         .env("HOME", &home)
         .arg("Anything else?");
-    assert!(next.output().await.unwrap().status.success());
+    succeeds(&mut next).await;
     // The endpoint holds both runs' requests, and the second run's only one is the last.
     let prompt = endpoint.requests().pop().unwrap();
     assert!(
@@ -564,18 +515,13 @@ async fn a_project_keeps_skills_of_its_own_and_they_come_first() {
         says("Counted."),
     ])
     .await;
-    let output = command(&endpoint)
-        .current_dir(&dir)
-        .env("HOME", &home)
-        .args(["Count the stock.", "--log", log.to_str().unwrap()])
-        .output()
-        .await
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "corpus failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    succeeds(
+        command(&endpoint)
+            .current_dir(&dir)
+            .env("HOME", &home)
+            .args(["Count the stock.", "--log", log.to_str().unwrap()]),
+    )
+    .await;
 
     let prompt = &endpoint.requests()[0];
     let own = own.canonicalize().unwrap();

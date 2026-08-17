@@ -6,15 +6,13 @@ mod common;
 use corpus_testkit::{runs_python, says, serve};
 use serde_json::Value;
 
-use common::{BIN, INTERRUPT_LINE, ask, command, events, printed, run_line, served, workdir};
+use common::{BIN, Step, ask, command, ends_turn, events, printed, served, succeeds, workdir};
 
 /// Ctrl-C stops the cell a person is watching, and nothing else. The agents that cell
 /// sent off keep working — killing them would throw away the very thing being waited on —
 /// and the handles are still in the namespace on the other side of the interrupt.
 #[tokio::test]
 async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
-    use tokio::io::AsyncWriteExt;
-
     let waiting = "kid = spawn('a job that takes a while')\n\
                    print('waiting')\n\
                    print('answered:', kid.result(timeout=300))\n";
@@ -30,51 +28,32 @@ async fn stopping_the_cell_that_waits_does_not_stop_what_it_waits_for() {
 
     let mut served = served(&endpoint);
 
-    let session = async {
-        served
-            .stdin
-            .write_all(&run_line("Send one off and wait."))
-            .await
-            .unwrap();
-        let mut stopped = false;
-        let mut printed = String::new();
-        while let Some(line) = served.lines.next_line().await.unwrap() {
-            let event: Value = serde_json::from_str(&line).unwrap();
+    let mut stopped = false;
+    served
+        .turn("Send one off and wait.", |event| {
             // The cell says when it has reached the wait, which is the only moment an
             // interrupt is testing anything.
-            if !stopped
-                && event["t"] == "tool_stream"
+            let waiting = event["t"] == "tool_stream"
                 && event["text"]
                     .as_str()
-                    .is_some_and(|text| text.contains("waiting"))
-            {
-                stopped = true;
-                served.stdin.write_all(INTERRUPT_LINE).await.unwrap();
+                    .is_some_and(|text| text.contains("waiting"));
+            match !stopped && waiting {
+                true => {
+                    stopped = true;
+                    Step::Interrupt
+                }
+                false => ends_turn(event),
             }
-            if event["t"] == "turn_end" {
-                break;
-            }
-        }
-        served
-            .stdin
-            .write_all(&run_line("What have you got?"))
-            .await
-            .unwrap();
-        while let Some(line) = served.lines.next_line().await.unwrap() {
-            let event: Value = serde_json::from_str(&line).unwrap();
-            if event["t"] == "tool_stream" {
-                printed.push_str(event["text"].as_str().unwrap_or_default());
-            }
-            if event["t"] == "turn_end" {
-                break;
-            }
-        }
-        printed
-    };
+        })
+        .await;
 
-    let printed = tokio::time::timeout(std::time::Duration::from_secs(60), session)
+    let printed: String = served
+        .turn("What have you got?", ends_turn)
         .await
-        .expect("the interrupted session never came back");
+        .iter()
+        .filter(|event| event["t"] == "tool_stream")
+        .filter_map(|event| event["text"].as_str())
+        .collect();
     assert!(
         printed.contains("still mine: ['a job that takes a while']"),
         "the handle must survive the interrupt: {printed}"
@@ -102,24 +81,16 @@ async fn a_child_finishing_does_not_end_the_turn_a_client_is_reading() {
     ])
     .await;
 
-    let output = command(&endpoint)
-        .args([
-            "connect",
-            "Send one off.",
-            "--log",
-            log.to_str().unwrap(),
-            "--",
-            BIN,
-            "serve",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "connect failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    succeeds(command(&endpoint).args([
+        "connect",
+        "Send one off.",
+        "--log",
+        log.to_str().unwrap(),
+        "--",
+        BIN,
+        "serve",
+    ]))
+    .await;
 
     let events = events(&log);
     // The child's turn and the session's own, and possibly the turn the news then
@@ -186,8 +157,6 @@ async fn what_an_agent_spends_is_on_its_parents_bill_and_not_in_its_context() {
 /// one `result()` away and would otherwise sit in the context for good.
 #[tokio::test]
 async fn an_agent_coming_back_is_a_turn_the_session_takes_on_its_own() {
-    use tokio::io::AsyncWriteExt;
-
     let long = "The numbers are 3, 5 and 8, and here is a great deal more about them: ".repeat(6);
     let endpoint = serve(vec![
         runs_python(
@@ -200,33 +169,19 @@ async fn an_agent_coming_back_is_a_turn_the_session_takes_on_its_own() {
     ])
     .await;
 
-    let mut served = served(&endpoint);
-
-    let session = async {
-        served
-            .stdin
-            .write_all(&run_line("Find the numbers."))
-            .await
-            .unwrap();
-        let mut seen = Vec::new();
-        let mut told = false;
-        while let Some(line) = served.lines.next_line().await.unwrap() {
-            let event: Value = serde_json::from_str(&line).unwrap();
+    let mut told = false;
+    let seen = served(&endpoint)
+        .turn("Find the numbers.", |event| {
             // Every agent's turns are in this stream, the child's among them, so the end
             // being waited for is the end of the turn the news itself started.
             let done = told && event["t"] == "turn_end";
             told |= event["t"] == "notice";
-            seen.push(event);
-            if done {
-                break;
+            match done {
+                true => Step::Stop,
+                false => Step::Go,
             }
-        }
-        seen
-    };
-
-    let seen = tokio::time::timeout(std::time::Duration::from_secs(60), session)
-        .await
-        .expect("the session never took the turn its child's news is for");
+        })
+        .await;
 
     let notice = seen
         .iter()
@@ -403,21 +358,12 @@ async fn a_file_a_cell_produced_leaves_the_session_as_an_event() {
     ])
     .await;
 
-    let output = command(&endpoint)
-        .current_dir(&dir)
-        .args([
-            "Write the report and send it.",
-            "--log",
-            log.to_str().unwrap(),
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "corpus failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    succeeds(command(&endpoint).current_dir(&dir).args([
+        "Write the report and send it.",
+        "--log",
+        log.to_str().unwrap(),
+    ]))
+    .await;
 
     let printed = printed(&log);
     assert!(
