@@ -108,22 +108,26 @@ def pdf(content, path="report.pdf", title=None):
     return str(path)
 
 
-def blocks(text, font=None):
-    """The flowables `pdf` would lay out for this text, so a document that needs
-    something the subset does not cover can be assembled from these plus anything else
-    reportlab offers: `pdf(blocks(text) + [Image('chart.png')], 'report.pdf')`.
+def parse(text):
+    """The markdown subset as `(kind, payload)` blocks, in the order they appear:
+
+        ("heading", (level, text))
+        ("table", [[cell, ...], ...])   the `|---|` rule row already dropped
+        ("item", (numbered, [text, ...]))
+        ("para", [line, ...])           joined by whoever renders it
 
     Understood: `#` headings, blank-line separated paragraphs, `-` and `1.` lists,
-    `|` tables, and `**bold**`, `*italic*` and `` `code` `` within a line.
+    `|` tables. Emphasis within a line is left in the text for the renderer, which is
+    the half that differs: a report has mini-HTML to put it in and a slide does not.
 
     ponytail: everything else is read as prose, so a link keeps its brackets and a
     fenced block loses its fence. Each is a branch in the loop below on the day a
     document needs it.
-    """
-    from reportlab.platypus import ListFlowable, ListItem, Paragraph
 
-    styles = _styles(font or unicode_font())
-    out = []
+    `slides` reads a deck from this rather than from a walk of its own, because a deck
+    that understood a different subset than the report it was cut from would differ
+    from it in exactly the places nobody thinks to check.
+    """
     lines = text.splitlines()
     at = 0
     while at < len(lines):
@@ -135,33 +139,58 @@ def blocks(text, font=None):
         kind = _kind(line)
         if kind == "heading":
             heading = _HEADING.match(line)
-            level = min(len(heading.group(1)), 6)
-            body = _inline(heading.group(2))
-            out.append(Paragraph(f"<b>{body}</b>", styles[f"Heading{level}"]))
+            yield "heading", (min(len(heading.group(1)), 6), heading.group(2))
             at += 1
         elif kind == "row":
             rows, at = _take(lines, at, lambda l: _kind(l) == "row")
-            out.append(_table(rows, styles))
+            yield "table", [_cells(row) for row in rows if not _RULE.match(row)]
         elif kind == "item":
             numbered = _NUMBERED.match(line) is not None
             raw, at = _take(lines, at, lambda l: _kind(l) == "item")
-            items = [
-                ListItem(Paragraph(_inline(_item(line)), styles["BodyText"]))
-                for line in raw
-            ]
+            yield "item", (numbered, [_item(line) for line in raw])
+        else:
+            # A paragraph runs until something else starts, and its line breaks are the
+            # width of whoever typed it rather than anything the reader should see.
+            raw, at = _take(lines, at, lambda l: l.strip() and _kind(l) is None)
+            yield "para", raw
+
+
+def _cells(row):
+    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+
+def blocks(text, font=None):
+    """The flowables `pdf` would lay out for this text, so a document that needs
+    something the subset does not cover can be assembled from these plus anything else
+    reportlab offers: `pdf(blocks(text) + [Image('chart.png')], 'report.pdf')`.
+
+    What is understood is what `parse` reads; this is only how it is drawn.
+    """
+    from reportlab.platypus import ListFlowable, ListItem, Paragraph
+
+    styles = _styles(font or unicode_font())
+    out = []
+    for kind, payload in parse(text):
+        if kind == "heading":
+            level, body = payload
+            out.append(Paragraph(f"<b>{_inline(body)}</b>", styles[f"Heading{level}"]))
+        elif kind == "table":
+            out.append(_table(payload, styles))
+        elif kind == "item":
+            numbered, texts = payload
             out.append(
                 ListFlowable(
-                    items,
+                    [
+                        ListItem(Paragraph(_inline(body), styles["BodyText"]))
+                        for body in texts
+                    ],
                     bulletType="1" if numbered else "bullet",
                     bulletFontName=styles["BodyText"].fontName,
                     leftIndent=18,
                 )
             )
         else:
-            # A paragraph runs until something else starts, and its line breaks are the
-            # width of whoever typed it rather than anything the reader should see.
-            raw, at = _take(lines, at, lambda l: l.strip() and _kind(l) is None)
-            body = " ".join(piece.strip() for piece in raw)
+            body = " ".join(piece.strip() for piece in payload)
             out.append(Paragraph(_inline(body), styles["BodyText"]))
     return out
 
@@ -217,13 +246,10 @@ def _table(rows, styles):
 
     cells = []
     for row in rows:
-        if _RULE.match(row):
-            continue
-        parts = [part.strip() for part in row.strip().strip("|").split("|")]
         # The header carries the weight, so it says so rather than relying on the fill.
         emphasis = "<b>{}</b>" if not cells else "{}"
         cells.append(
-            [Paragraph(emphasis.format(_inline(part)), styles["BodyText"]) for part in parts]
+            [Paragraph(emphasis.format(_inline(part)), styles["BodyText"]) for part in row]
         )
     if not cells:
         return Spacer(1, 1)

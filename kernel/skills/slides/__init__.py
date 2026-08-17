@@ -58,51 +58,46 @@ def _slides(text):
     """The deck as `(title, heading level, blocks)`, where a block is `("text", line)`,
     `("table", rows)` or `("image", path)`.
 
-    The markdown is read with `documents`' own dispatch rather than a second copy of it.
-    Those names are private to that module, and this reaches past that on purpose: a deck
+    The markdown is read by `documents.parse` rather than by a second copy of it: a deck
     that understood a different subset than the report it was cut from would differ from it
-    in exactly the places nobody thinks to check.
+    in exactly the places nobody thinks to check. What is left here is the half that really
+    does differ — a picture becomes a slide of its own, and emphasis is stripped rather than
+    marked up.
     """
-    from documents import _HEADING, _RULE, _item, _kind, _take
+    from documents import parse
 
     slides = []
-    lines = text.splitlines()
-    at = 0
-    while at < len(lines):
-        line = lines[at]
-        if not line.strip():
-            at += 1
-            continue
-
-        picture = _IMAGE.match(line)
-        if picture is not None:
-            _current(slides).append(("image", picture.group(1)))
-            at += 1
-            continue
-
-        kind = _kind(line)
+    for kind, payload in parse(text):
         if kind == "heading":
-            heading = _HEADING.match(line)
-            slides.append((_plain(heading.group(2)), len(heading.group(1)), []))
-            at += 1
-        elif kind == "row":
-            rows, at = _take(lines, at, lambda line: _kind(line) == "row")
-            cells = [
-                [cell.strip() for cell in row.strip().strip("|").split("|")]
-                for row in rows
-                if not _RULE.match(row)
-            ]
-            _current(slides).append(("table", cells))
+            level, body = payload
+            slides.append((_plain(body), level, []))
+        elif kind == "table":
+            _current(slides).append(("table", payload))
         elif kind == "item":
-            raw, at = _take(lines, at, lambda line: _kind(line) == "item")
-            for item in raw:
-                _current(slides).append(("text", _plain(_item(item))))
+            _, texts = payload
+            for body in texts:
+                _current(slides).append(("text", _plain(body)))
         else:
-            raw, at = _take(lines, at, lambda line: line.strip() and _kind(line) is None)
-            # A paragraph's line breaks are the width of whoever typed it; a slide's are
-            # the width of the slide.
-            _current(slides).append(("text", _plain(" ".join(piece.strip() for piece in raw))))
+            _current(slides).extend(_prose(payload))
     return slides
+
+
+def _prose(lines):
+    """A paragraph's lines as the blocks a slide makes of them: a picture on a line of its
+    own stands alone, and the prose around it is joined — its line breaks are the width of
+    whoever typed it, and a slide's are the width of the slide."""
+    said = []
+    for line in lines:
+        picture = _IMAGE.match(line)
+        if picture is None:
+            said.append(line.strip())
+            continue
+        if said:
+            yield "text", _plain(" ".join(said))
+            said = []
+        yield "image", picture.group(1)
+    if said:
+        yield "text", _plain(" ".join(said))
 
 
 def _current(slides):
@@ -149,11 +144,13 @@ def _table(show, title, rows):
     shape = _slide(show, 5, title).shapes.add_table(
         len(rows), columns, Inches(_MARGIN), Inches(_TOP), width, height
     )
+    # Read once: python-pptx builds a fresh wrapper on every access to `.table`.
+    table = shape.table
     for down, row in enumerate(rows):
         for across in range(columns):
             # A row short of the rectangle is the writer's slip, and an empty cell says so
             # more usefully than an exception thrown while saving.
-            shape.table.cell(down, across).text = _plain(
+            table.cell(down, across).text = _plain(
                 row[across] if across < len(row) else ""
             )
 
