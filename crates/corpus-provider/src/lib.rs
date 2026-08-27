@@ -670,30 +670,11 @@ struct Acc {
     calls: BTreeMap<u64, PartialCall>,
     stop: Option<StopReason>,
     usage: Usage,
-    /// When the model first said something. Latched once and never moved.
+    /// When the model first said something a reader could see. Latched where a delta is
+    /// actually emitted, not where one looks likely: a frame carrying only a control
+    /// token, or only the name of a call whose arguments have not started, reaches nobody
+    /// and must not start the clock.
     first_token: Option<Instant>,
-}
-
-/// Whether a delta moved the answer forward. The opening frame of a stream is
-/// `content:""` and gateways send heartbeats that carry nothing, so a measure taken at the
-/// first delta of any kind flatters itself by a chunk. What counts is the first delta a
-/// reader would have seen.
-fn carries_token(delta: &Value) -> bool {
-    let said = |key: &str| delta[key].as_str().is_some_and(|text| !text.is_empty());
-    said("content")
-        || said("reasoning")
-        || said("reasoning_content")
-        || delta["tool_calls"]
-            .as_array()
-            .is_some_and(|calls| calls.iter().any(names_or_writes))
-}
-
-fn names_or_writes(call: &Value) -> bool {
-    call["function"]["name"].is_string()
-        || call["name"].is_string()
-        || call["function"]["arguments"]
-            .as_str()
-            .is_some_and(|args| !args.is_empty())
 }
 
 impl Acc {
@@ -712,6 +693,7 @@ impl Acc {
         let Ok(chunk) = serde_json::from_str::<Value>(payload) else {
             return false;
         };
+        let mut spoke = false;
 
         if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
             self.usage.input = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
@@ -725,9 +707,6 @@ impl Acc {
                 .map(|cached| cached as u32);
         }
         for choice in chunk["choices"].as_array().into_iter().flatten() {
-            if self.first_token.is_none() && carries_token(&choice["delta"]) {
-                self.first_token = Some(Instant::now());
-            }
             if let Some(reason) = choice["finish_reason"].as_str() {
                 self.stop = Some(match reason {
                     "tool_calls" | "function_call" => StopReason::ToolCalls,
@@ -739,7 +718,7 @@ impl Acc {
             if let Some(text) = delta["content"].as_str().filter(|t| !t.is_empty()) {
                 let text = self.clean_text.feed(text);
                 if !text.is_empty() {
-                    self.answer(text, on_delta);
+                    spoke |= self.answer(text, on_delta);
                 }
             }
             // Some models put the whole answer in `reasoning`; reading only `content`
@@ -750,6 +729,7 @@ impl Acc {
                     if !text.is_empty() {
                         self.reasoning.push_str(&text);
                         on_delta(Delta::Reasoning(&text));
+                        spoke = true;
                     }
                 }
             }
@@ -778,9 +758,15 @@ impl Acc {
                     let written = slot.written.feed(args);
                     if !written.is_empty() {
                         on_delta(Delta::Code(&written));
+                        // Set here and applied below: `slot` holds a borrow of `self.calls`
+                        // for the length of this loop.
+                        spoke = true;
                     }
                 }
             }
+        }
+        if spoke {
+            self.first_token.get_or_insert_with(Instant::now);
         }
         false
     }
@@ -794,13 +780,15 @@ impl Acc {
         Some(buffer[at + THOUGHT_END.len()..].to_string())
     }
 
-    fn answer(&mut self, text: String, on_delta: &mut dyn FnMut(Delta<'_>)) {
+    /// Returns whether any of it reached the reader. Text held back against a `</think>`
+    /// that may still arrive has not.
+    fn answer(&mut self, text: String, on_delta: &mut dyn FnMut(Delta<'_>)) -> bool {
         // Only a response that has already streamed reasoning can still have its answer
         // turn out to be the tail of a thought.
         if self.settled || self.reasoning.is_empty() {
             self.text.push_str(&text);
             on_delta(Delta::Text(&text));
-            return;
+            return true;
         }
         self.withheld.push_str(&text);
         let held = std::mem::take(&mut self.withheld);
@@ -809,14 +797,16 @@ impl Acc {
             None if held.len() > HOLD => held,
             None => {
                 self.withheld = held;
-                return;
+                return false;
             }
         };
         self.settled = true;
-        if !ready.is_empty() {
-            self.text.push_str(&ready);
-            on_delta(Delta::Text(&ready));
+        if ready.is_empty() {
+            return false;
         }
+        self.text.push_str(&ready);
+        on_delta(Delta::Text(&ready));
+        true
     }
 
     /// The stream ended and no terminator ever came, so what was held back has to be
@@ -836,6 +826,7 @@ impl Acc {
             self.reasoning.push_str(&held);
             on_delta(Delta::Reasoning(&held));
         }
+        self.first_token.get_or_insert_with(Instant::now);
     }
 
     /// Always after `flush`, which is what places whatever was held back.
@@ -879,37 +870,6 @@ impl Acc {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The clock cannot settle this one: in a test every frame of a stream arrives on the
-    /// same read, so which frame was picked is only visible in the predicate itself.
-    #[test]
-    fn only_a_delta_a_reader_would_have_seen_starts_the_clock() {
-        let silent = [
-            json!({}),
-            json!({ "content": "" }),
-            json!({ "role": "assistant", "content": "" }),
-            json!({ "reasoning": "" }),
-            json!({ "tool_calls": [] }),
-            json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "" } }] }),
-        ];
-        for delta in silent {
-            assert!(!carries_token(&delta), "{delta} says nothing a reader sees");
-        }
-
-        let spoke = [
-            json!({ "content": "h" }),
-            json!({ "reasoning": "h" }),
-            json!({ "reasoning_content": "h" }),
-            json!({ "tool_calls": [{ "index": 0, "function": { "name": "python" } }] }),
-            json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "{" } }] }),
-        ];
-        for delta in spoke {
-            assert!(
-                carries_token(&delta),
-                "{delta} is the model saying something"
-            );
-        }
-    }
 
     #[test]
     fn a_gateways_own_name_for_a_model_finds_the_weights_it_serves() {

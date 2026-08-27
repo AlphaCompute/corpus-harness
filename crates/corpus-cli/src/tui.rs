@@ -401,6 +401,11 @@ enum Action {
 
 /// What the session has cost so far, and what it is carrying.
 ///
+/// The model is given one tool and it is `python`, so what a step spends its time on is
+/// writing a cell and waiting for the interpreter to run it. There are no tool calls to
+/// count: the unit of work below a step is a cell, and the unit above it is a spawned
+/// agent with an interpreter of its own.
+///
 /// Tokens come from the root's `TurnEnd`, never from summing steps: a delegated turn's
 /// spend is already folded into its parent's bill, so a total built from both counts
 /// every child twice. Steps and model time are the root loop's own and come from
@@ -409,11 +414,16 @@ enum Action {
 struct Stats {
     turns: u32,
     steps: u32,
+    cells: u32,
     input: u32,
     output: u32,
     cached: Option<u32>,
+    /// A turn whose provider said nothing about its cache makes the session's rate
+    /// unknowable rather than lower: what it served from cache is neither counted nor
+    /// known to be nothing.
+    cache_blind: bool,
     llm_ms: u64,
-    tool_ms: u64,
+    cell_ms: u64,
     /// Summed and counted rather than averaged as it goes, so a step that streamed
     /// nothing leaves the average alone instead of pulling it to zero.
     ttft_ms: u64,
@@ -429,19 +439,31 @@ impl Stats {
     /// The five groups, joined by ` | `, items inside a group by ` · `. A group with
     /// nothing to say drops out whole rather than printing a zero, because a zero here is
     /// a measurement and every one of these can legitimately be unmeasured.
-    fn line(&self) -> String {
+    /// `spawned` is passed in rather than counted here: the screen already keeps the
+    /// children it is tracking, and a second tally would be a second thing to keep right.
+    fn figures(&self, spawned: usize) -> String {
         let mut groups: Vec<String> = Vec::new();
         let join = |items: Vec<String>| items.join(" · ");
 
         if self.steps > 0 {
-            groups.push(format!("{} turns · {} steps", self.turns, self.steps));
+            let mut counts = vec![
+                format!("{} turns", self.turns),
+                format!("{} steps", self.steps),
+            ];
+            if self.cells > 0 {
+                counts.push(format!("{} cells", self.cells));
+            }
+            if spawned > 0 {
+                counts.push(format!("{spawned} spawned"));
+            }
+            groups.push(join(counts));
 
             let mut times = Vec::new();
             if self.llm_ms > 0 {
                 times.push(format!("LLM {}", dur(self.llm_ms)));
             }
-            if self.tool_ms > 0 {
-                times.push(format!("Tool call {}", dur(self.tool_ms)));
+            if self.cell_ms > 0 {
+                times.push(format!("Cell {}", dur(self.cell_ms)));
             }
             if !times.is_empty() {
                 groups.push(join(times));
@@ -470,7 +492,7 @@ impl Stats {
         if self.input > 0 || self.output > 0 {
             // Absent means the provider never reported a cache. Nothing here invents a
             // miss out of that silence.
-            if let Some(cached) = self.cached.filter(|_| self.input > 0) {
+            if let Some(cached) = self.cached.filter(|_| !self.cache_blind && self.input > 0) {
                 let share = (cached as f64 / self.input as f64 * 100.0).round();
                 groups.push(format!("Cache hit {share}%"));
             }
@@ -721,6 +743,8 @@ impl App {
             Event::ToolEnd {
                 ok, summary, ms, ..
             } => {
+                self.stats.cells += 1;
+                self.stats.cell_ms += ms;
                 self.finish_tool(ok, &summary, ms);
                 self.answer_at = None;
                 self.busy_with("thinking");
@@ -736,11 +760,16 @@ impl App {
                 ..
             } => {
                 self.stats.turns += 1;
-                // Whole, not added: `usage` already carries every step of this turn and
-                // every child it sent off, so a running total would count them again.
-                self.stats.input = usage.input;
-                self.stats.output = usage.output;
-                self.stats.cached = usage.cached;
+                // Added per turn, not per step: `usage` already carries every step of this
+                // turn and every child it sent off, so folding the steps in as well would
+                // count them twice — but a second turn is a second bill, not a restatement
+                // of the first.
+                self.stats.input += usage.input;
+                self.stats.output += usage.output;
+                match usage.cached {
+                    Some(cached) => *self.stats.cached.get_or_insert(0) += cached,
+                    None => self.stats.cache_blind = true,
+                }
                 self.stats.shape = shape;
                 // A turn stopped mid-cell keeps the code it had written on screen, but
                 // the place it was going to stays behind with it.
@@ -933,7 +962,10 @@ impl App {
         // empty until there is something measured to say, and an empty row reads as one
         // blank line rather than as a readout claiming zero.
         frame.render_widget(
-            Paragraph::new(Line::styled(format!(" {}", self.stats.line()), muted())),
+            Paragraph::new(Line::styled(
+                format!(" {}", self.stats.figures(self.kids.len())),
+                muted(),
+            )),
             figures,
         );
         frame.render_widget(
@@ -1198,7 +1230,7 @@ mod tests {
 
         // 619 tokens written across the 8.3s between the first token and the answer.
         assert_eq!(
-            app.stats.line(),
+            app.stats.figures(0),
             "1 turns · 1 steps | LLM 10.5s | TTFT avg 2.2s · 75 tok/s | Input 11.6K tok · Output 619 tok"
         );
         assert_eq!(
@@ -1207,11 +1239,11 @@ mod tests {
         );
     }
 
-    /// A provider that reports no cache has not reported a miss. Nothing invents one.
+    /// A provider that reports no cache has not reported a miss. Nothing invents one, and
+    /// one silent turn makes the whole session's share unknowable rather than lower.
     #[test]
     fn an_unreported_cache_is_left_out_rather_than_called_cold() {
         let agent = Uuid::now_v7();
-        let mut app = App::new();
         let ending = |cached| Event::TurnEnd {
             turn_id: agent,
             agent,
@@ -1226,18 +1258,67 @@ mod tests {
             context: 1_000,
         };
 
-        app.on_event(ending(None));
+        let mut silent = App::new();
+        silent.on_event(ending(None));
+        let line = silent.stats.figures(0);
+        assert!(!line.contains("Cache hit"), "{line}");
+
+        let mut reported = App::new();
+        reported.on_event(ending(Some(250)));
+        reported.on_event(ending(Some(250)));
+        let line = reported.stats.figures(0);
+        assert!(line.contains("Cache hit 25%"), "{line}");
         assert!(
-            !app.stats.line().contains("Cache hit"),
-            "{}",
-            app.stats.line()
+            line.contains("Input 2K tok"),
+            "the turns are a running bill: {line}"
         );
 
-        app.on_event(ending(Some(250)));
+        // One turn the provider said nothing about, and the share stops being a
+        // measurement of the session rather than becoming a smaller one.
+        reported.on_event(ending(None));
+        let line = reported.stats.figures(0);
+        assert!(!line.contains("Cache hit"), "{line}");
+    }
+
+    /// The model is given one tool and it is `python`, so the work below a step is a cell
+    /// and there is nothing to call a tool call.
+    #[test]
+    fn the_figures_count_cells_and_children_not_tool_calls() {
+        let agent = Uuid::now_v7();
+        let mut app = App::new();
+        app.on_event(Event::StepEnd {
+            turn_id: agent,
+            agent,
+            step: 1,
+            llm_ms: 4_000,
+            ttft_ms: Some(1_000),
+            usage: Usage {
+                input: 100,
+                output: 20,
+                cached: None,
+            },
+        });
+        app.on_event(Event::ToolStart {
+            agent,
+            call_id: "c1".into(),
+            name: "python".into(),
+            args: json!({ "code": "print(1)" }),
+        });
+        app.on_event(Event::ToolEnd {
+            agent,
+            call_id: "c1".into(),
+            ok: true,
+            summary: "1".into(),
+            ms: 2_500,
+        });
+
+        let line = app.stats.figures(2);
+        assert!(line.contains("1 cells"), "{line}");
+        assert!(line.contains("2 spawned"), "{line}");
+        assert!(line.contains("Cell 2.5s"), "{line}");
         assert!(
-            app.stats.line().contains("Cache hit 25%"),
-            "{}",
-            app.stats.line()
+            !line.contains("Tool call"),
+            "there are no tool calls here: {line}"
         );
     }
 

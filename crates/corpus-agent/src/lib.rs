@@ -500,6 +500,11 @@ impl Agent {
         let mut context = 0;
         let mut answer = String::new();
         let mut steps = 0;
+        // Taken while `self.messages` still holds exactly what was measured. By the time
+        // the turn ends the answer and its tool results have been pushed, and apportioning
+        // the measured total across those would credit the conversation with bytes the
+        // provider never counted.
+        let mut shape = ContextShape::default();
 
         let stop = loop {
             if cancelled.has_changed().unwrap_or(false) {
@@ -549,6 +554,7 @@ impl Agent {
             let ttft_ms = completion.ttft_ms;
             let reason = completion.stop;
             context = completion.usage.input;
+            shape = self.shape(context);
 
             // Text is the answer only when the model asked for nothing else. Narration
             // alongside a tool call is not an answer, however it reads.
@@ -611,7 +617,7 @@ impl Agent {
             usage,
             context,
             wall_ms: started.elapsed().as_millis() as u64,
-            shape: self.shape(context),
+            shape,
         });
         Ok(Outcome { text: answer, stop })
     }

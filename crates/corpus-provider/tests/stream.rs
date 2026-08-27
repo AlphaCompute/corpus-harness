@@ -406,3 +406,37 @@ async fn cached_prompt_tokens_are_read_in_every_dialect_and_invented_in_none() {
         assert_eq!(completion.usage.input, 70);
     }
 }
+
+/// The stream carries things a reader never sees: control tokens the cleaner strips, and
+/// the opening frame of a call, which names the function before any of its arguments
+/// exist. Timing from those reports a first token nobody could have read — and under this
+/// harness almost every step opens a call, so it is not a rounding error.
+#[tokio::test]
+async fn only_what_reached_the_reader_starts_the_clock() {
+    let endpoint = serve(vec![sse(&[
+        &delta(r#""content":"<|im_start|>""#),
+        &finish("stop"),
+    ])])
+    .await;
+    let (completion, seen) = ask(&endpoint.url).await;
+    assert_eq!(seen, "", "the cleaner strips it, so nothing was shown");
+    assert_eq!(
+        completion.ttft_ms, None,
+        "a stream whose every frame was stripped showed nothing to time"
+    );
+
+    let named = serde_json::json!({
+        "index": 0, "id": "call_1", "type": "function",
+        "function": { "name": "python" },
+    });
+    let endpoint = serve(vec![sse(&[
+        &delta(&format!(r#""tool_calls":[{named}]"#)),
+        &finish("tool_calls"),
+    ])])
+    .await;
+    let (completion, _) = ask(&endpoint.url).await;
+    assert_eq!(
+        completion.ttft_ms, None,
+        "a call announced with no arguments has written nothing yet"
+    );
+}
