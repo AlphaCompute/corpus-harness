@@ -11,6 +11,17 @@ import traceback
 
 MAX_REPR = 4000
 
+# What the namespace summary may say about one cell. A run that binds two hundred names
+# is a run whose interesting ones are the few it just touched, and a panel nobody can read
+# is worth less than a short one that is true.
+MAX_NAMES = 40
+MAX_NAME_REPR = 60
+
+# Values small enough that showing them says more than their type does. Anything else is
+# described rather than printed: `repr` on a two-hundred-thousand-row frame builds the
+# whole string before anyone can truncate it, and this runs after every cell.
+_SHOWN = (bool, int, float, complex, str, bytes)
+
 # The protocol must survive `print` inside a cell forging a frame, so it moves off fd 1
 # before anything else runs: fd 1 becomes stderr (subprocesses can only pollute the log),
 # sys.stdout becomes a proxy that emits `stream` frames.
@@ -134,7 +145,77 @@ def _safe_repr(value):
     return f"{text[:MAX_REPR]}... [truncated; the full value is in `_` (repr: {len(text)} chars)]"
 
 
-def _run(cell_id, code, ns):
+def _describe(value):
+    """A binding as a reader needs it: what it is, how big, and its value only when the
+    value is small enough to be the more useful of the two."""
+    kind = type(value).__name__
+    size = None
+    shown = None
+    try:
+        shape = getattr(value, "shape", None)
+        if isinstance(shape, tuple) and shape:
+            size = "\u00d7".join(str(part) for part in shape)
+        elif not isinstance(value, (str, bytes)):
+            size = str(len(value))
+    except BaseException:
+        size = None
+    if isinstance(value, _SHOWN):
+        try:
+            text = repr(value)
+        except BaseException:
+            text = None
+        if text is not None and len(text) <= MAX_NAME_REPR:
+            shown = text
+        elif isinstance(value, (str, bytes)):
+            size = f"{len(value)} chars" if isinstance(value, str) else f"{len(value)} bytes"
+    return {"name": None, "type": kind, "size": size, "repr": shown}
+
+
+def _namespace(ns, floor, seen):
+    """What this cell left behind that the one before it did not.
+
+    Only the difference: a cell that touched one name should read as having touched one
+    name. `floor` is what the harness bound before any cell ran, which is furniture rather
+    than the model's work — until the model rebinds one, and then it is worth saying.
+    """
+    now = {}
+    for name, value in list(ns.items()):
+        if name.startswith("__") or name == "_":
+            continue
+        if name in floor and ns[name] is floor[name]:
+            continue
+        now[name] = _describe(value)
+
+    changed = []
+    for name, about in now.items():
+        if seen.get(name) != about:
+            about = dict(about, name=name)
+            changed.append(about)
+    gone = [name for name in seen if name not in now]
+
+    seen.clear()
+    seen.update(now)
+
+    # One budget for both: a cell that deletes two hundred tracked names would
+    # otherwise send every one of them, and a frame nobody can read is worth less
+    # than a short one that says how much it left out.
+    trimmed = max(0, len(changed) - MAX_NAMES)
+    changed = changed[:MAX_NAMES]
+    room = MAX_NAMES - len(changed)
+    trimmed += max(0, len(gone) - room)
+    gone = gone[:room]
+    return changed, gone, trimmed
+
+
+def _left(ns, floor, seen):
+    """A cell that raised bound whatever it got through before it did."""
+    if seen is None:
+        return {}
+    names, gone, trimmed = _namespace(ns, floor, seen)
+    return {"names": names, "gone": gone, "trimmed": trimmed}
+
+
+def _run(cell_id, code, ns, floor=None, seen=None):
     global _current_id
     _current_id = cell_id
     try:
@@ -149,16 +230,24 @@ def _run(cell_id, code, ns):
             # IPython's bargain, for IPython's reason: a result too big to read is not lost,
             # it is one name away. None is skipped so a statement cell cannot erase it.
             ns["_"] = value
+        names, gone, trimmed = (
+            _namespace(ns, floor, seen) if seen is not None else ([], [], 0)
+        )
         _send(
             type="done",
             id=cell_id,
             status="ok",
             repr="" if value is None else _safe_repr(value),
+            names=names,
+            gone=gone,
+            trimmed=trimmed,
         )
     except KeyboardInterrupt:
-        _send(type="done", id=cell_id, status="error", traceback="KeyboardInterrupt: cell interrupted")
+        _send(type="done", id=cell_id, status="error",
+              traceback="KeyboardInterrupt: cell interrupted", **_left(ns, floor, seen))
     except BaseException:
-        _send(type="done", id=cell_id, status="error", traceback=traceback.format_exc())
+        _send(type="done", id=cell_id, status="error",
+              traceback=traceback.format_exc(), **_left(ns, floor, seen))
     finally:
         _current_id = ""
 
@@ -207,6 +296,10 @@ def main():
     # reads as empty rather than raising over a name the prompt promised.
     ns = {"__name__": "__corpus__", "HostError": HostError, "_": ""}
     _bind(ns, init.get("fns", []))
+    # Taken by identity, so a name the model rebinds stops being furniture and starts
+    # being its work — which is exactly when it becomes worth reporting.
+    floor = dict(ns)
+    seen = {}
 
     sys.stdout = _StreamProxy()
     sys.stderr = _StreamProxy()
@@ -218,7 +311,7 @@ def main():
             cell = _cells.get()
         except KeyboardInterrupt:
             continue  # interrupt landed between cells
-        _run(cell["id"], cell["code"], ns)
+        _run(cell["id"], cell["code"], ns, floor, seen)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -59,6 +60,11 @@ pub struct Tools {
     /// Shared by every search. `fetch_url` builds its own instead, because it pins the one
     /// address it checked and that pin belongs to a single request.
     http: reqwest::Client,
+    /// Input and output tokens `llm_batch` has spent since the agent last drained it. A
+    /// batch is model calls the agent never made and so cannot bill; without this they are
+    /// spent and never counted, and a batch of two hundred prompts is most of what a turn
+    /// costs.
+    spent: Mutex<(u32, u32)>,
 }
 
 impl Tools {
@@ -75,6 +81,7 @@ impl Tools {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("http client"),
+            spent: Mutex::new((0, 0)),
         }
     }
 
@@ -168,7 +175,12 @@ impl Tools {
                 let asked = [Message::text(Role::User, prompt)];
                 let quiet = &mut |_: Delta<'_>| {};
                 match tokio::time::timeout_at(deadline, self.llm.stream(&asked, &[], quiet)).await {
-                    Ok(Ok(answer)) => answer.text,
+                    Ok(Ok(answer)) => {
+                        let mut spent = self.spent.lock().expect("spent");
+                        spent.0 = spent.0.saturating_add(answer.usage.input);
+                        spent.1 = spent.1.saturating_add(answer.usage.output);
+                        answer.text
+                    }
                     Ok(Err(failure)) => format!("ERROR: {failure:#}"),
                     Err(_) => "ERROR: the batch ran out of time before this prompt".into(),
                 }
@@ -413,6 +425,10 @@ impl Host for Tools {
             other => Err(format!("no host function named `{other}`")),
         }
     }
+
+    fn drain_tokens(&self) -> (u32, u32) {
+        std::mem::take(&mut *self.spent.lock().expect("spent"))
+    }
 }
 
 /// Anything that looks like a credential is replaced before the text leaves the agent,
@@ -482,6 +498,37 @@ mod tests {
         };
         let tools = Tools::new(provider, None, Some(Children::new(recipe, root, told)));
         (tools, heard, root)
+    }
+
+    /// What a batch spends is spent against the same budget the turn is, but the agent
+    /// never made these calls and so has no other way to learn of them. Draining has to
+    /// zero as it reads: a second drain that repeated the first would bill every batch
+    /// once per step for the rest of the turn.
+    #[tokio::test]
+    async fn a_batch_bills_every_prompt_once() {
+        fn spending(input: u32, output: u32) -> Vec<u8> {
+            corpus_testkit::sse(&[
+                &corpus_testkit::content("ok"),
+                &corpus_testkit::finish("stop"),
+                &format!(
+                    r#"{{"choices":[],"usage":{{"prompt_tokens":{input},"completion_tokens":{output}}}}}"#
+                ),
+            ])
+        }
+
+        let endpoint = serve(vec![spending(30, 4), spending(12, 6)]).await;
+        let tools = batching(&endpoint.url);
+        tools
+            .call("llm_batch", json!({ "prompts": ["one", "two"] }))
+            .await
+            .expect("batch");
+
+        assert_eq!(tools.drain_tokens(), (42, 10));
+        assert_eq!(
+            tools.drain_tokens(),
+            (0, 0),
+            "a drained batch is billed, and billing it again would double every batch in the turn"
+        );
     }
 
     #[test]

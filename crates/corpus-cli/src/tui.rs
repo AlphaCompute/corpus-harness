@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use corpus_agent::Event;
+use corpus_agent::{ContextShape, Event};
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event as Term, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Margin, Position};
@@ -104,6 +104,32 @@ fn tokens(count: u32) -> String {
         1_000..100_000 => format!("{:.1}k", count as f32 / 1000.0),
         _ => format!("{}k", count / 1000),
     }
+}
+
+/// The token counts of the stats row, which is a contract shared with the web viewer:
+/// both render the same string from the same numbers, so both round them the same way.
+/// [`tokens`] stays as it is — the window gauge beside it has said `12.4k` all along.
+fn toks(count: u32) -> String {
+    let scaled = |value: f32| match value >= 100.0 {
+        true => format!("{:.0}", value.round()),
+        false => format!("{}", (value * 10.0).round() / 10.0),
+    };
+    match count {
+        0..1_000 => count.to_string(),
+        1_000..1_000_000 => format!("{}K", scaled(count as f32 / 1000.0)),
+        _ => format!("{}M", scaled(count as f32 / 1_000_000.0)),
+    }
+}
+
+/// Seconds to one decimal until a minute, whole seconds after: `45.2s`, then `2m42s`.
+/// The other half of the contract with the web viewer.
+fn dur(ms: u64) -> String {
+    let seconds = ms as f64 / 1000.0;
+    if seconds < 60.0 {
+        return format!("{}s", (seconds * 10.0).round() / 10.0);
+    }
+    let whole = seconds.round() as u64;
+    format!("{}m{}s", whole / 60, whole % 60)
 }
 
 fn took(ms: u64) -> String {
@@ -373,6 +399,133 @@ enum Action {
     Quit,
 }
 
+/// What the session has cost so far, and what it is carrying.
+///
+/// The model is given one tool and it is `python`, so what a step spends its time on is
+/// writing a cell and waiting for the interpreter to run it. There are no tool calls to
+/// count: the unit of work below a step is a cell, and the unit above it is a spawned
+/// agent with an interpreter of its own.
+///
+/// Tokens come from the root's `TurnEnd`, never from summing steps: a delegated turn's
+/// spend is already folded into its parent's bill, so a total built from both counts
+/// every child twice. Steps and model time are the root loop's own and come from
+/// `StepEnd`, which is the only place a step that answered in text leaves a mark.
+#[derive(Default)]
+struct Stats {
+    turns: u32,
+    steps: u32,
+    cells: u32,
+    input: u32,
+    output: u32,
+    cached: Option<u32>,
+    /// A turn whose provider said nothing about its cache makes the session's rate
+    /// unknowable rather than lower: what it served from cache is neither counted nor
+    /// known to be nothing.
+    cache_blind: bool,
+    llm_ms: u64,
+    cell_ms: u64,
+    /// Summed and counted rather than averaged as it goes, so a step that streamed
+    /// nothing leaves the average alone instead of pulling it to zero.
+    ttft_ms: u64,
+    ttft_steps: u32,
+    /// First token to the end of the answer, and the tokens written in that window. The
+    /// throughput a reader watches is the decode, not the wait before it.
+    decode_ms: u64,
+    decode_tokens: u32,
+    shape: ContextShape,
+}
+
+impl Stats {
+    /// The five groups, joined by ` | `, items inside a group by ` · `. A group with
+    /// nothing to say drops out whole rather than printing a zero, because a zero here is
+    /// a measurement and every one of these can legitimately be unmeasured.
+    /// `spawned` is passed in rather than counted here: the screen already keeps the
+    /// children it is tracking, and a second tally would be a second thing to keep right.
+    fn figures(&self, spawned: usize) -> String {
+        let mut groups: Vec<String> = Vec::new();
+        let join = |items: Vec<String>| items.join(" · ");
+
+        if self.steps > 0 {
+            let mut counts = vec![
+                format!("{} turns", self.turns),
+                format!("{} steps", self.steps),
+            ];
+            if self.cells > 0 {
+                counts.push(format!("{} cells", self.cells));
+            }
+            if spawned > 0 {
+                counts.push(format!("{spawned} spawned"));
+            }
+            groups.push(join(counts));
+
+            let mut times = Vec::new();
+            if self.llm_ms > 0 {
+                times.push(format!("LLM {}", dur(self.llm_ms)));
+            }
+            if self.cell_ms > 0 {
+                times.push(format!("Cell {}", dur(self.cell_ms)));
+            }
+            if !times.is_empty() {
+                groups.push(join(times));
+            }
+
+            let mut speeds = Vec::new();
+            if self.ttft_steps > 0 {
+                speeds.push(format!(
+                    "TTFT avg {}",
+                    dur(self.ttft_ms / self.ttft_steps as u64)
+                ));
+            }
+            if self.decode_ms > 0 {
+                let rate = self.decode_tokens as f64 / (self.decode_ms as f64 / 1000.0);
+                let shown = match rate >= 10.0 {
+                    true => format!("{}", rate.round() as u64),
+                    false => format!("{}", (rate * 10.0).round() / 10.0),
+                };
+                speeds.push(format!("{shown} tok/s"));
+            }
+            if !speeds.is_empty() {
+                groups.push(join(speeds));
+            }
+        }
+
+        if self.input > 0 || self.output > 0 {
+            // Absent means the provider never reported a cache. Nothing here invents a
+            // miss out of that silence.
+            if let Some(cached) = self.cached.filter(|_| !self.cache_blind && self.input > 0) {
+                let share = (cached as f64 / self.input as f64 * 100.0).round();
+                groups.push(format!("Cache hit {share}%"));
+            }
+            groups.push(format!(
+                "Input {} tok · Output {} tok",
+                toks(self.input),
+                toks(self.output)
+            ));
+        }
+
+        groups.join(" | ")
+    }
+
+    /// Where the window went, marked as the approximation it is. Empty when nothing has
+    /// been apportioned yet.
+    fn shape_line(&self) -> String {
+        let ContextShape {
+            system,
+            tools,
+            messages,
+        } = self.shape;
+        match system + tools + messages {
+            0 => String::new(),
+            _ => format!(
+                "~sys {} · tools {} · msgs {} ",
+                toks(system),
+                toks(tools),
+                toks(messages)
+            ),
+        }
+    }
+}
+
 #[derive(Default)]
 struct App {
     model: String,
@@ -402,6 +555,7 @@ struct App {
     /// finished. A child's own stream never reaches the screen: it is in the log, and
     /// what a reader needs here is that one started and that one came back.
     kids: std::collections::HashMap<uuid::Uuid, String>,
+    stats: Stats,
 }
 
 struct RunningTool {
@@ -455,7 +609,29 @@ impl App {
             return;
         }
         match event {
-            Event::SessionStart { model, .. } => self.model = model,
+            Event::SessionStart { model, window, .. } => {
+                self.model = model;
+                // A served session learns its window here and nowhere else: the readout's
+                // own lookup runs beside a local agent, not a remote one.
+                if self.window == 0 {
+                    self.window = window;
+                }
+            }
+            Event::StepEnd {
+                llm_ms,
+                ttft_ms,
+                usage,
+                ..
+            } => {
+                self.stats.steps += 1;
+                self.stats.llm_ms += llm_ms;
+                if let Some(ttft) = ttft_ms {
+                    self.stats.ttft_ms += ttft;
+                    self.stats.ttft_steps += 1;
+                    self.stats.decode_ms += llm_ms.saturating_sub(ttft);
+                    self.stats.decode_tokens += usage.output;
+                }
+            }
             Event::UserMessage { text, .. } => {
                 self.answer_at = None;
                 self.transcript.blank();
@@ -567,15 +743,60 @@ impl App {
             Event::ToolEnd {
                 ok, summary, ms, ..
             } => {
+                self.stats.cells += 1;
+                self.stats.cell_ms += ms;
                 self.finish_tool(ok, &summary, ms);
                 self.answer_at = None;
                 self.busy_with("thinking");
+            }
+            Event::Namespace {
+                names,
+                gone,
+                trimmed,
+                ..
+            } => {
+                // Under the cell it belongs to, and only what changed: a run keeps its data
+                // in the namespace, so the useful line is what this cell put there.
+                let mut said: Vec<String> = names
+                    .iter()
+                    .map(|binding| match (&binding.repr, &binding.size) {
+                        (Some(shown), _) => format!("{} {shown}", binding.name),
+                        (None, Some(size)) => {
+                            format!("{} {} {size}", binding.name, binding.kind)
+                        }
+                        (None, None) => format!("{} {}", binding.name, binding.kind),
+                    })
+                    .collect();
+                said.extend(gone.iter().map(|name| format!("−{name}")));
+                if trimmed > 0 {
+                    said.push(format!("+{trimmed} more"));
+                }
+                if !said.is_empty() {
+                    self.transcript.line(2, muted(), said.join(" · "));
+                }
             }
             Event::Compaction { dropped, .. } => {
                 self.transcript
                     .line(0, muted(), format!("· compacted {dropped} tool results"))
             }
-            Event::TurnEnd { context, .. } => {
+            Event::TurnEnd {
+                context,
+                usage,
+                shape,
+                ..
+            } => {
+                self.stats.turns += 1;
+                // Added per turn, not per step: `usage` already carries every step of this
+                // turn and every child it sent off, so folding the steps in as well would
+                // count them twice — but a second turn is a second bill, not a restatement
+                // of the first.
+                self.stats.input += usage.input;
+                self.stats.output += usage.output;
+                match usage.cached {
+                    Some(cached) => *self.stats.cached.get_or_insert(0) += cached,
+                    None => self.stats.cache_blind = true,
+                }
+                self.stats.shape = shape;
                 // A turn stopped mid-cell keeps the code it had written on screen, but
                 // the place it was going to stays behind with it.
                 self.writing_at = None;
@@ -716,8 +937,9 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [body, prompt, status] = Layout::vertical([
+        let [body, prompt, status, figures] = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -761,6 +983,21 @@ impl App {
         }
         frame.render_widget(Paragraph::new(Line::styled(left, muted())), status);
         frame.render_widget(Paragraph::new(self.fill()).right_aligned(), status);
+
+        // What the session cost on the left, where the window went on the right. Both are
+        // empty until there is something measured to say, and an empty row reads as one
+        // blank line rather than as a readout claiming zero.
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {}", self.stats.figures(self.kids.len())),
+                muted(),
+            )),
+            figures,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::styled(self.stats.shape_line(), muted())).right_aligned(),
+            figures,
+        );
 
         // The input is one line: long text scrolls sideways rather than growing the box.
         let room = prompt.width.saturating_sub(3) as usize;
@@ -952,9 +1189,241 @@ mod tests {
 
     /// The row under the prompt, as a reader sees it: the outer padding is trimmed but
     /// the gap that separates the two ends of the row is not.
+    /// The model-and-window row, which is the second from the bottom now that the figures
+    /// have a line of their own.
     fn status(app: &mut App) -> String {
-        let screen = screen(app, 60, 12);
-        screen.lines().next_back().unwrap().trim().to_string()
+        row_from_bottom(app, 1)
+    }
+
+    /// What the session cost, and where its window went.
+    fn figures(app: &mut App) -> String {
+        row_from_bottom(app, 0)
+    }
+
+    /// Counted down from the top of a terminal of known height, because a row with
+    /// nothing on it is not in `screen`'s output at all and counting up from the bottom
+    /// would silently return whichever row happened to be last.
+    fn row_from_bottom(app: &mut App, up: usize) -> String {
+        const HEIGHT: usize = 12;
+        let screen = screen(app, 90, HEIGHT as u16);
+        let lines: Vec<&str> = screen.lines().collect();
+        lines
+            .get(HEIGHT - 1 - up)
+            .map_or(String::new(), |row| row.trim().to_string())
+    }
+
+    /// The figures row is a contract with the web viewer: both build the same string from
+    /// the same numbers, so the exact string is what is pinned.
+    #[test]
+    fn the_figures_row_reads_the_way_the_web_viewer_reads_it() {
+        let agent = Uuid::now_v7();
+        let mut app = App::new();
+        assert_eq!(
+            figures(&mut app),
+            "",
+            "a session that has done nothing measures nothing"
+        );
+
+        app.on_event(Event::StepEnd {
+            turn_id: agent,
+            agent,
+            step: 1,
+            llm_ms: 10_500,
+            ttft_ms: Some(2_200),
+            usage: Usage {
+                input: 11_600,
+                output: 619,
+                cached: None,
+            },
+        });
+        app.on_event(Event::TurnEnd {
+            turn_id: agent,
+            agent,
+            stop: StopReason::Stop,
+            usage: Usage {
+                input: 11_600,
+                output: 619,
+                cached: None,
+            },
+            wall_ms: 13_200,
+            shape: ContextShape {
+                system: 1_600,
+                tools: 6_500,
+                messages: 4_000,
+            },
+            context: 12_100,
+        });
+
+        // 619 tokens written across the 8.3s between the first token and the answer.
+        assert_eq!(
+            app.stats.figures(0),
+            "1 turns · 1 steps | LLM 10.5s | TTFT avg 2.2s · 75 tok/s | Input 11.6K tok · Output 619 tok"
+        );
+        assert_eq!(
+            app.stats.shape_line().trim(),
+            "~sys 1.6K · tools 6.5K · msgs 4K"
+        );
+    }
+
+    /// A provider that reports no cache has not reported a miss. Nothing invents one, and
+    /// one silent turn makes the whole session's share unknowable rather than lower.
+    #[test]
+    fn an_unreported_cache_is_left_out_rather_than_called_cold() {
+        let agent = Uuid::now_v7();
+        let ending = |cached| Event::TurnEnd {
+            turn_id: agent,
+            agent,
+            stop: StopReason::Stop,
+            usage: Usage {
+                input: 1_000,
+                output: 10,
+                cached,
+            },
+            wall_ms: 0,
+            shape: ContextShape::default(),
+            context: 1_000,
+        };
+
+        let mut silent = App::new();
+        silent.on_event(ending(None));
+        let line = silent.stats.figures(0);
+        assert!(!line.contains("Cache hit"), "{line}");
+
+        let mut reported = App::new();
+        reported.on_event(ending(Some(250)));
+        reported.on_event(ending(Some(250)));
+        let line = reported.stats.figures(0);
+        assert!(line.contains("Cache hit 25%"), "{line}");
+        assert!(
+            line.contains("Input 2K tok"),
+            "the turns are a running bill: {line}"
+        );
+
+        // One turn the provider said nothing about, and the share stops being a
+        // measurement of the session rather than becoming a smaller one.
+        reported.on_event(ending(None));
+        let line = reported.stats.figures(0);
+        assert!(!line.contains("Cache hit"), "{line}");
+    }
+
+    /// The model is given one tool and it is `python`, so the work below a step is a cell
+    /// and there is nothing to call a tool call.
+    #[test]
+    fn the_figures_count_cells_and_children_not_tool_calls() {
+        let agent = Uuid::now_v7();
+        let mut app = App::new();
+        app.on_event(Event::StepEnd {
+            turn_id: agent,
+            agent,
+            step: 1,
+            llm_ms: 4_000,
+            ttft_ms: Some(1_000),
+            usage: Usage {
+                input: 100,
+                output: 20,
+                cached: None,
+            },
+        });
+        app.on_event(Event::ToolStart {
+            agent,
+            call_id: "c1".into(),
+            name: "python".into(),
+            args: json!({ "code": "print(1)" }),
+        });
+        app.on_event(Event::ToolEnd {
+            agent,
+            call_id: "c1".into(),
+            ok: true,
+            summary: "1".into(),
+            ms: 2_500,
+        });
+
+        let line = app.stats.figures(2);
+        assert!(line.contains("1 cells"), "{line}");
+        assert!(line.contains("2 spawned"), "{line}");
+        assert!(line.contains("Cell 2.5s"), "{line}");
+        assert!(
+            !line.contains("Tool call"),
+            "there are no tool calls here: {line}"
+        );
+    }
+
+    /// The namespace is where the data lives, so what a cell left there is the line that
+    /// says what actually happened. Values stay in the interpreter; the screen gets the
+    /// shape of them.
+    #[test]
+    fn a_cell_says_what_it_left_in_the_namespace() {
+        let agent = Uuid::now_v7();
+        let mut app = App::new();
+        app.on_event(Event::Namespace {
+            agent,
+            call_id: "c1".into(),
+            names: vec![
+                corpus_kernel::Binding {
+                    name: "n".into(),
+                    kind: "int".into(),
+                    size: None,
+                    repr: Some("43".into()),
+                },
+                corpus_kernel::Binding {
+                    name: "frame".into(),
+                    kind: "DataFrame".into(),
+                    size: Some("200000\u{d7}12".into()),
+                    repr: None,
+                },
+            ],
+            gone: vec!["chunks".into()],
+            trimmed: 3,
+        });
+
+        let shown = screen(&mut app, 90, 12);
+        assert!(shown.contains("n 43"), "{shown}");
+        assert!(shown.contains("frame DataFrame 200000\u{d7}12"), "{shown}");
+        assert!(
+            shown.contains("\u{2212}chunks"),
+            "a name that went is worth saying: {shown}"
+        );
+        assert!(
+            shown.contains("+3 more"),
+            "what did not fit is said, not dropped: {shown}"
+        );
+    }
+
+    /// The cell collapses into one line when it finishes, and the summary of what it
+    /// bound must not collapse with it.
+    #[test]
+    fn what_a_cell_bound_survives_the_cell_collapsing() {
+        let agent = Uuid::now_v7();
+        let mut app = App::new();
+        app.on_event(Event::ToolStart {
+            agent,
+            call_id: "c1".into(),
+            name: "python".into(),
+            args: json!({ "code": "n = 43" }),
+        });
+        // The order the agent sends them in, and the reason it does.
+        app.on_event(Event::ToolEnd {
+            agent,
+            call_id: "c1".into(),
+            ok: true,
+            summary: "ok".into(),
+            ms: 5,
+        });
+        app.on_event(Event::Namespace {
+            agent,
+            call_id: "c1".into(),
+            names: vec![corpus_kernel::Binding {
+                name: "n".into(),
+                kind: "int".into(),
+                size: None,
+                repr: Some("43".into()),
+            }],
+            gone: vec![],
+            trimmed: 0,
+        });
+
+        let shown = screen(&mut app, 90, 12);
+        assert!(shown.contains("n 43"), "{shown}");
     }
 
     fn press(app: &mut App, code: KeyCode) -> Action {
@@ -988,6 +1457,7 @@ mod tests {
             Event::SessionStart {
                 session_id: agent,
                 model: "test-model".into(),
+                window: 0,
             },
             Event::UserMessage {
                 turn_id: agent,
@@ -1243,6 +1713,8 @@ mod tests {
                 agent: child,
                 stop: StopReason::Stop,
                 usage: Usage::default(),
+                wall_ms: 0,
+                shape: ContextShape::default(),
                 context: 190_000,
             },
             Event::AgentEnd {
@@ -1367,7 +1839,10 @@ mod tests {
             usage: Usage {
                 input: 99_999,
                 output: 12,
+                cached: None,
             },
+            wall_ms: 0,
+            shape: ContextShape::default(),
             context,
         };
 
@@ -1421,12 +1896,15 @@ mod tests {
         app.on_event(Event::SessionStart {
             session_id: agent,
             model: "gpt-4o".into(),
+            window: 0,
         });
         app.on_event(Event::TurnEnd {
             turn_id: agent,
             agent,
             stop: StopReason::Stop,
             usage: Usage::default(),
+            wall_ms: 0,
+            shape: ContextShape::default(),
             context: 900,
         });
 

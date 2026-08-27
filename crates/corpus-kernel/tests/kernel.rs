@@ -485,3 +485,63 @@ async fn the_kernel_leaves_when_its_host_does() {
         .expect("a kernel nobody can reach must not outlive its host");
     assert!(status.unwrap().success());
 }
+
+/// The namespace is where a run's data lives, so what a cell put there is the one thing
+/// the log could never say. Names and shapes travel; the values stay in the interpreter,
+/// which is the whole reason they are kept there.
+#[tokio::test]
+async fn a_cell_reports_what_it_left_in_the_namespace() {
+    let mut kernel = start().await;
+
+    let (bound, _) = run(&mut kernel, "n = 42\nchunks = [str(i) for i in range(200)]").await;
+    let by_name: std::collections::HashMap<&str, &corpus_kernel::Binding> =
+        bound.names.iter().map(|b| (b.name.as_str(), b)).collect();
+    assert_eq!(by_name["n"].kind, "int");
+    assert_eq!(by_name["n"].repr.as_deref(), Some("42"));
+    assert_eq!(by_name["chunks"].kind, "list");
+    assert_eq!(by_name["chunks"].size.as_deref(), Some("200"));
+    assert!(
+        by_name["chunks"].repr.is_none(),
+        "two hundred strings are described, not printed"
+    );
+    assert!(
+        !by_name.contains_key("fetch_url"),
+        "the host's own functions are furniture, not the model's work"
+    );
+
+    // Only the difference: a cell that touched one name reads as having touched one name.
+    let (again, _) = run(&mut kernel, "n = 43\ndel chunks").await;
+    assert_eq!(
+        again
+            .names
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect::<Vec<_>>(),
+        ["n"]
+    );
+    assert_eq!(again.names[0].repr.as_deref(), Some("43"));
+    assert_eq!(again.gone, ["chunks"]);
+
+    // One budget covers both: a cell that deletes far more names than the summary
+    // holds would otherwise send every one of them.
+    let (many, _) = run(&mut kernel, "for i in range(120): globals()[f'n{i}'] = i").await;
+    assert!(
+        many.names.len() <= 40,
+        "{} names reported",
+        many.names.len()
+    );
+    assert!(many.trimmed > 0, "what did not fit is counted, not dropped");
+    let (cleared, _) = run(&mut kernel, "for i in range(120): del globals()[f'n{i}']").await;
+    assert!(
+        cleared.names.len() + cleared.gone.len() <= 40,
+        "{} reported after a mass delete",
+        cleared.names.len() + cleared.gone.len()
+    );
+    assert!(cleared.trimmed > 0);
+
+    // A value too big to be worth printing is measured instead.
+    let (big, _) = run(&mut kernel, "big = 'x' * 5000").await;
+    let big = big.names.iter().find(|b| b.name == "big").expect("bound");
+    assert_eq!(big.size.as_deref(), Some("5000 chars"));
+    assert!(big.repr.is_none());
+}

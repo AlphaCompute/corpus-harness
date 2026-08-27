@@ -372,3 +372,71 @@ async fn a_stray_scrap_of_content_beside_a_tool_call_is_not_an_answer() {
         completion.reasoning
     );
 }
+
+/// A stream that never says anything has no first token to report, and a zero would read
+/// as an instant answer rather than as silence.
+#[tokio::test]
+async fn a_silent_stream_reports_no_first_token() {
+    let endpoint = serve(vec![sse(&[&finish("stop")])]).await;
+    let (completion, _) = ask(&endpoint.url).await;
+    assert_eq!(completion.ttft_ms, None);
+}
+
+/// Three gateways, three spellings, one number. A gateway that names none leaves it unset:
+/// zero would claim a cold cache that was never measured.
+#[tokio::test]
+async fn cached_prompt_tokens_are_read_in_every_dialect_and_invented_in_none() {
+    let spellings = [
+        (r#""prompt_tokens_details":{"cached_tokens":64}"#, Some(64)),
+        (r#""prompt_cache_hit_tokens":64"#, Some(64)),
+        (r#""cache_read_input_tokens":64"#, Some(64)),
+        (r#""total_tokens":80"#, None),
+    ];
+    for (spelling, expected) in spellings {
+        let endpoint = serve(vec![sse(&[
+            &delta(r#""content":"hi""#),
+            &finish("stop"),
+            &format!(
+                r#"{{"choices":[],"usage":{{"prompt_tokens":70,"completion_tokens":10,{spelling}}}}}"#
+            ),
+        ])])
+        .await;
+        let (completion, _) = ask(&endpoint.url).await;
+        assert_eq!(completion.usage.cached, expected, "spelling: {spelling}");
+        assert_eq!(completion.usage.input, 70);
+    }
+}
+
+/// The stream carries things a reader never sees: control tokens the cleaner strips, and
+/// the opening frame of a call, which names the function before any of its arguments
+/// exist. Timing from those reports a first token nobody could have read — and under this
+/// harness almost every step opens a call, so it is not a rounding error.
+#[tokio::test]
+async fn only_what_reached_the_reader_starts_the_clock() {
+    let endpoint = serve(vec![sse(&[
+        &delta(r#""content":"<|im_start|>""#),
+        &finish("stop"),
+    ])])
+    .await;
+    let (completion, seen) = ask(&endpoint.url).await;
+    assert_eq!(seen, "", "the cleaner strips it, so nothing was shown");
+    assert_eq!(
+        completion.ttft_ms, None,
+        "a stream whose every frame was stripped showed nothing to time"
+    );
+
+    let named = serde_json::json!({
+        "index": 0, "id": "call_1", "type": "function",
+        "function": { "name": "python" },
+    });
+    let endpoint = serve(vec![sse(&[
+        &delta(&format!(r#""tool_calls":[{named}]"#)),
+        &finish("tool_calls"),
+    ])])
+    .await;
+    let (completion, _) = ask(&endpoint.url).await;
+    assert_eq!(
+        completion.ttft_ms, None,
+        "a call announced with no arguments has written nothing yet"
+    );
+}

@@ -69,6 +69,23 @@ pub async fn corpus(endpoint: &Endpoint, args: &[&str], env: &[(&str, &str)]) ->
     succeeds(&mut command).await
 }
 
+/// The same, for a case that is about the refusal rather than the answer.
+pub async fn corpus_raw(
+    endpoint: &Endpoint,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (String, Option<i32>) {
+    let mut command = command(endpoint);
+    command.args(args);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let output = command.output().await.expect("corpus runs");
+    let mut said = String::from_utf8_lossy(&output.stdout).into_owned();
+    said.push_str(&String::from_utf8_lossy(&output.stderr));
+    (said, output.status.code())
+}
+
 /// One prompt, logged where the test can read it: the shape most of these tests want.
 pub async fn ask(endpoint: &Endpoint, prompt: &str, log: &Path) -> Output {
     corpus(endpoint, &[prompt, "--log", log.to_str().unwrap()], &[]).await
@@ -180,7 +197,17 @@ pub fn transcript(log: &Path) -> Vec<Value> {
     events(log)
         .into_iter()
         .map(|mut event| {
-            for key in ["session_id", "turn_id", "agent", "at"] {
+            // Ids and clocks: what a second run of the same session cannot repeat, and
+            // what no assertion about a transcript is ever about.
+            for key in [
+                "session_id",
+                "turn_id",
+                "agent",
+                "at",
+                "llm_ms",
+                "ttft_ms",
+                "wall_ms",
+            ] {
                 event.as_object_mut().unwrap().remove(key);
             }
             event

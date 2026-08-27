@@ -167,7 +167,17 @@ struct Local {
 #[derive(Subcommand)]
 enum Mode {
     /// Speak the session protocol on stdin and stdout.
-    Serve,
+    Serve {
+        /// Continue the session recorded in this log. A served session is one turn of a
+        /// conversation that outlives the process running it, so where it picks up from
+        /// has to be said on the way in — there is nobody to ask once it is speaking the
+        /// protocol.
+        #[arg(long)]
+        resume: Option<PathBuf>,
+        /// Record this turn here, so the next one has something to resume from.
+        #[arg(long)]
+        log: Option<PathBuf>,
+    },
     /// Drive a session that runs behind a pipe.
     Connect {
         prompt: Option<String>,
@@ -553,8 +563,59 @@ impl Sink {
             Event::ToolStream { text, .. } => print!("{text}"),
             Event::ToolEnd { ok, summary, .. } => println!("{} {summary}", tui::mark(*ok)),
             Event::Compaction { dropped, .. } => println!("· compacted {dropped} tool results"),
-            Event::TurnEnd { stop, usage, .. } => {
-                println!("\n· {stop:?} · {} in / {} out", usage.input, usage.output)
+            Event::Namespace {
+                names,
+                gone,
+                trimmed,
+                ..
+            } => {
+                let mut bound: Vec<String> = names
+                    .iter()
+                    .map(|binding| match (&binding.repr, &binding.size) {
+                        (Some(shown), _) => format!("{} {shown}", binding.name),
+                        (None, Some(size)) => format!("{} {} {size}", binding.name, binding.kind),
+                        (None, None) => format!("{} {}", binding.name, binding.kind),
+                    })
+                    .chain(gone.iter().map(|name| format!("−{name}")))
+                    .collect();
+                if *trimmed > 0 {
+                    bound.push(format!("+{trimmed} more"));
+                }
+                println!("  {}", bound.join(" · "))
+            }
+            Event::StepEnd {
+                step,
+                llm_ms,
+                ttft_ms,
+                usage,
+                ..
+            } => {
+                let ttft = ttft_ms.map_or(String::new(), |ms| format!(" · ttft {ms}ms"));
+                println!(
+                    "\n· step {step} · {llm_ms}ms{ttft} · {} in / {} out",
+                    usage.input, usage.output
+                )
+            }
+            Event::TurnEnd {
+                stop,
+                usage,
+                wall_ms,
+                shape,
+                ..
+            } => {
+                // An unmeasured shape is three zeroes, and printing them would claim a
+                // prompt made of nothing rather than a split nobody worked out.
+                let split = match shape.system + shape.tools + shape.messages {
+                    0 => String::new(),
+                    _ => format!(
+                        " · ~sys {} · tools {} · msgs {}",
+                        shape.system, shape.tools, shape.messages
+                    ),
+                };
+                println!(
+                    "\n· {stop:?} · {wall_ms}ms · {} in / {} out{split}",
+                    usage.input, usage.output
+                )
             }
             _ => {}
         }
@@ -603,6 +664,10 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         }
     }
     let model = provider.model.clone();
+    // The same number twice: the readout waits on it, and the session announces it. A
+    // session that started before the answer landed would otherwise put zero on the wire
+    // and leave every downstream reading without a denominator.
+    let announced = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (found, known) = tokio::sync::oneshot::channel();
     match window {
         // Asking for the listing is worth a percentage on screen, and never worth a
@@ -611,17 +676,20 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         0 if !asked => {
             let ask = provider.clone();
             let named = model.clone();
+            let filled = announced.clone();
             tokio::spawn(async move {
                 let listed = ask.models().await.unwrap_or_default();
                 let tokens = listed
                     .iter()
                     .find(|model| model.id == named)
                     .map_or(0, |model| model.window);
+                filled.store(tokens, std::sync::atomic::Ordering::Relaxed);
                 let _ = found.send(tokens);
             });
         }
         // Zero here is a listing that was read and stated nothing: no share on screen.
         named => {
+            announced.store(named, std::sync::atomic::Ordering::Relaxed);
             let _ = found.send(named);
         }
     }
@@ -656,7 +724,7 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         agent.replay(Jsonl::read::<Event>(path)?);
     }
     Ok((
-        LocalSession::new(agent, model.clone(), heard),
+        LocalSession::new(agent, model.clone(), heard, announced),
         Opening {
             model,
             window: known,
@@ -698,10 +766,16 @@ async fn drive(session: &mut dyn Session, prompt: Option<String>, sink: &mut Sin
     session.finish(&mut record).await
 }
 
-async fn serve() -> Result<()> {
-    let (mut session, _) = build_local(None).await?;
+async fn serve(resume: Option<&Path>, log: Option<&Path>) -> Result<()> {
+    // Refused before anything is built. A log that was named but is not there means a
+    // conversation the caller believes it is continuing would come back with no memory of
+    // itself and nothing to say it had lost one, which is worse than not starting.
+    if let Some(path) = resume.filter(|path| !path.exists()) {
+        bail!("cannot resume: {} does not exist", path.display());
+    }
+    let (mut session, _) = build_local(resume).await?;
     let interrupt = session.interrupt();
-    let mut sink = Sink::new(Render::Protocol, None)?;
+    let mut sink = Sink::new(Render::Protocol, log)?;
 
     // Commands are read off the main loop, because an interrupt is only worth anything
     // if it can be read while the turn it interrupts is still running. A plain thread,
@@ -808,7 +882,7 @@ async fn main() -> Result<()> {
             }
             start(Box::new(session), prompt, path.as_deref(), opening).await
         }
-        Some(Mode::Serve) => serve().await,
+        Some(Mode::Serve { resume, log }) => serve(resume.as_deref(), log.as_deref()).await,
         Some(Mode::Connect { prompt, log, argv }) => {
             let session = Remote::spawn(&argv).await?;
             // Nobody on this side of the pipe holds the provider, so neither the model

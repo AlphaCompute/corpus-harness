@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, Serializer};
@@ -116,6 +116,12 @@ pub enum StopReason {
 pub struct Usage {
     pub input: u32,
     pub output: u32,
+    /// Prompt tokens the provider served from its own cache. `None` is a provider that
+    /// never said, which is not the same as a cache that missed: rendering it as zero
+    /// would assert a cold cache nobody measured. Every gateway spells it differently and
+    /// the reference one spells it not at all.
+    #[serde(default)]
+    pub cached: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -240,6 +246,10 @@ pub struct Completion {
     pub tool_calls: Vec<ToolCall>,
     pub stop: StopReason,
     pub usage: Usage,
+    /// Request sent to the first delta a reader would have seen, on the attempt that
+    /// answered. Retries are the caller's to account for: it is the one that knows it
+    /// waited. `None` when the stream ended without ever saying anything.
+    pub ttft_ms: Option<u64>,
 }
 
 /// The names an OpenAI-compatible listing gives the context window. Every gateway spells
@@ -433,6 +443,7 @@ impl Provider {
                 "tools": tools,
             }}));
         }
+        let sent = Instant::now();
         let mut response = self
             .http
             .post(&url)
@@ -480,7 +491,7 @@ impl Provider {
                 traced(read, &line);
                 if acc.feed(&line, on_delta) {
                     acc.flush(on_delta);
-                    return Ok(acc.finish());
+                    return Ok(acc.finish(sent));
                 }
                 line.clear();
             }
@@ -490,7 +501,7 @@ impl Provider {
         traced(read, &line);
         acc.feed(&line, on_delta);
         acc.flush(on_delta);
-        Ok(acc.finish())
+        Ok(acc.finish(sent))
     }
 }
 
@@ -659,6 +670,11 @@ struct Acc {
     calls: BTreeMap<u64, PartialCall>,
     stop: Option<StopReason>,
     usage: Usage,
+    /// When the model first said something a reader could see. Latched where a delta is
+    /// actually emitted, not where one looks likely: a frame carrying only a control
+    /// token, or only the name of a call whose arguments have not started, reaches nobody
+    /// and must not start the clock.
+    first_token: Option<Instant>,
 }
 
 impl Acc {
@@ -677,10 +693,18 @@ impl Acc {
         let Ok(chunk) = serde_json::from_str::<Value>(payload) else {
             return false;
         };
+        let mut spoke = false;
 
         if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
             self.usage.input = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
             self.usage.output = usage["completion_tokens"].as_u64().unwrap_or(0) as u32;
+            // Three spellings for one number, in the order the gateways we speak to use
+            // them. Absent everywhere leaves it None.
+            self.usage.cached = usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .or_else(|| usage["prompt_cache_hit_tokens"].as_u64())
+                .or_else(|| usage["cache_read_input_tokens"].as_u64())
+                .map(|cached| cached as u32);
         }
         for choice in chunk["choices"].as_array().into_iter().flatten() {
             if let Some(reason) = choice["finish_reason"].as_str() {
@@ -694,7 +718,7 @@ impl Acc {
             if let Some(text) = delta["content"].as_str().filter(|t| !t.is_empty()) {
                 let text = self.clean_text.feed(text);
                 if !text.is_empty() {
-                    self.answer(text, on_delta);
+                    spoke |= self.answer(text, on_delta);
                 }
             }
             // Some models put the whole answer in `reasoning`; reading only `content`
@@ -705,6 +729,7 @@ impl Acc {
                     if !text.is_empty() {
                         self.reasoning.push_str(&text);
                         on_delta(Delta::Reasoning(&text));
+                        spoke = true;
                     }
                 }
             }
@@ -733,9 +758,15 @@ impl Acc {
                     let written = slot.written.feed(args);
                     if !written.is_empty() {
                         on_delta(Delta::Code(&written));
+                        // Set here and applied below: `slot` holds a borrow of `self.calls`
+                        // for the length of this loop.
+                        spoke = true;
                     }
                 }
             }
+        }
+        if spoke {
+            self.first_token.get_or_insert_with(Instant::now);
         }
         false
     }
@@ -749,13 +780,15 @@ impl Acc {
         Some(buffer[at + THOUGHT_END.len()..].to_string())
     }
 
-    fn answer(&mut self, text: String, on_delta: &mut dyn FnMut(Delta<'_>)) {
+    /// Returns whether any of it reached the reader. Text held back against a `</think>`
+    /// that may still arrive has not.
+    fn answer(&mut self, text: String, on_delta: &mut dyn FnMut(Delta<'_>)) -> bool {
         // Only a response that has already streamed reasoning can still have its answer
         // turn out to be the tail of a thought.
         if self.settled || self.reasoning.is_empty() {
             self.text.push_str(&text);
             on_delta(Delta::Text(&text));
-            return;
+            return true;
         }
         self.withheld.push_str(&text);
         let held = std::mem::take(&mut self.withheld);
@@ -764,14 +797,16 @@ impl Acc {
             None if held.len() > HOLD => held,
             None => {
                 self.withheld = held;
-                return;
+                return false;
             }
         };
         self.settled = true;
-        if !ready.is_empty() {
-            self.text.push_str(&ready);
-            on_delta(Delta::Text(&ready));
+        if ready.is_empty() {
+            return false;
         }
+        self.text.push_str(&ready);
+        on_delta(Delta::Text(&ready));
+        true
     }
 
     /// The stream ended and no terminator ever came, so what was held back has to be
@@ -791,10 +826,11 @@ impl Acc {
             self.reasoning.push_str(&held);
             on_delta(Delta::Reasoning(&held));
         }
+        self.first_token.get_or_insert_with(Instant::now);
     }
 
     /// Always after `flush`, which is what places whatever was held back.
-    fn finish(mut self) -> Completion {
+    fn finish(mut self, sent: Instant) -> Completion {
         self.text.push_str(&self.clean_text.flush());
         // A terminator that arrived after the hold gave up still marks where thinking ended.
         let text = std::mem::take(&mut self.text);
@@ -824,6 +860,9 @@ impl Acc {
             tool_calls,
             stop,
             usage: self.usage,
+            ttft_ms: self
+                .first_token
+                .map(|at| at.duration_since(sent).as_millis() as u64),
         }
     }
 }

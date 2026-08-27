@@ -21,6 +21,15 @@ const STDERR_TAIL: usize = 8192;
 #[async_trait]
 pub trait Host: Send + Sync {
     async fn call(&self, name: &str, args: Value) -> Result<Value, String>;
+
+    /// Input and output tokens the host spent on the agent's behalf since it was last
+    /// asked, and zeroed by the asking. A tool that talks to a model spends against the
+    /// same budget the turn does, but the agent never sees those calls, so the count has
+    /// to be collected rather than observed. A plain tuple keeps a provider's `Usage` out
+    /// of the kernel, which has no other reason to know about one.
+    fn drain_tokens(&self) -> (u32, u32) {
+        (0, 0)
+    }
 }
 
 #[derive(Debug)]
@@ -28,6 +37,27 @@ pub struct ExecOutcome {
     pub ok: bool,
     pub repr: String,
     pub traceback: String,
+    /// What the cell left in the namespace that was not there before it ran, and what it
+    /// took away. Only the difference: the namespace is where a run's data lives, and a
+    /// panel that redrew all of it after every cell would say nothing about the cell.
+    pub names: Vec<Binding>,
+    pub gone: Vec<String>,
+    /// Names the summary would not fit. Reported rather than dropped in silence.
+    pub trimmed: u32,
+}
+
+/// A name the cell bound, as a reader needs it: what it is, how big, and its value only
+/// where the value is small enough to be the more useful of the two. The value itself
+/// stays in the interpreter — that is the whole point of keeping it there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Binding {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub repr: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +84,12 @@ enum Frame {
         repr: String,
         #[serde(default)]
         traceback: String,
+        #[serde(default)]
+        names: Vec<Binding>,
+        #[serde(default)]
+        gone: Vec<String>,
+        #[serde(default)]
+        trimmed: u32,
     },
 }
 
@@ -302,11 +338,17 @@ impl Kernel {
                     status,
                     repr,
                     traceback,
+                    names,
+                    gone,
+                    trimmed,
                 } if cell == id => {
                     return Ok(ExecOutcome {
                         ok: status == "ok",
                         repr,
                         traceback,
+                        names,
+                        gone,
+                        trimmed,
                     });
                 }
                 _ => {} // frames from an abandoned cell
