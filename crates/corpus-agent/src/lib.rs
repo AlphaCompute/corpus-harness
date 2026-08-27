@@ -19,6 +19,18 @@ const DROPPED: &str =
 const RESUMED: &str = "\n\nThis session was resumed from a log. The interpreter is fresh: \
     the variables, imports and `_` the transcript talks about no longer exist.";
 
+/// Where a turn's context went, in tokens. The provider hands back the prompt's exact
+/// total and says nothing about its parts, so the parts are apportioned by serialized
+/// size: near enough to answer "where did my window go", and never exact. Nothing shows
+/// these three without marking them as approximate, and nothing presents them as summing
+/// to the total they were derived from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextShape {
+    pub system: u32,
+    pub tools: u32,
+    pub messages: u32,
+}
+
 /// The session log. The model's context is derived from it, never stored beside it,
 /// which is what lets compaction drop tool output without losing the session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +39,10 @@ pub enum Event {
     SessionStart {
         session_id: Uuid,
         model: String,
+        /// How much context the model was advertised to have. Zero is a provider that
+        /// never said, and a reading with no denominator is not shown at all.
+        #[serde(default)]
+        window: u32,
     },
     TurnStart {
         turn_id: Uuid,
@@ -106,11 +122,38 @@ pub enum Event {
         agent: Uuid,
         dropped: usize,
     },
+    /// One pass through the loop: one model call and whatever tools it asked for. A step
+    /// that answers in text calls no tools and so leaves no other trace, which is why the
+    /// count cannot be recovered from the rest of the log.
+    ///
+    /// `usage` is this step's alone — a child's is never folded in. Summing steps is the
+    /// only way to total a session without counting a delegated turn twice, because
+    /// `TurnEnd.usage` deliberately carries the children's spend as well.
+    StepEnd {
+        turn_id: Uuid,
+        agent: Uuid,
+        step: u32,
+        /// The whole model call, retries and their backoff included.
+        llm_ms: u64,
+        /// Request sent to the first delta a reader would have seen, on the attempt that
+        /// answered. Absent when the model never said anything.
+        #[serde(default)]
+        ttft_ms: Option<u64>,
+        usage: Usage,
+    },
     TurnEnd {
         turn_id: Uuid,
         agent: Uuid,
         stop: StopReason,
         usage: Usage,
+        /// Wall time from the prompt landing to the answer, which is not the sum of the
+        /// steps' model time: tools run between them, and children run beside them.
+        #[serde(default)]
+        wall_ms: u64,
+        /// Where `context` went, apportioned by serialized size. An approximation, and
+        /// marked as one wherever it is shown.
+        #[serde(default)]
+        shape: ContextShape,
         /// What the last step of the turn sent, which is what the session is carrying
         /// now. `usage.input` is the turn's whole bill and counts a long turn's context
         /// once per step, so it says nothing about how full the window is.
@@ -145,6 +188,7 @@ impl Event {
             | Event::ToolEnd { agent, .. }
             | Event::UserFile { agent, .. }
             | Event::Compaction { agent, .. }
+            | Event::StepEnd { agent, .. }
             | Event::TurnEnd { agent, .. }
             | Event::Answer { agent, .. } => Some(*agent),
         }
@@ -490,6 +534,9 @@ impl Agent {
                 }),
             };
             let left = self.budget.wall_clock.saturating_sub(started.elapsed());
+            // Timed here rather than inside the provider, so a step that spent most of its
+            // wait backing off between retries says so.
+            let asked = Instant::now();
             let completion = tokio::select! {
                 biased;
                 // Waiting on the model is where a turn spends most of its time, so both
@@ -498,27 +545,52 @@ impl Agent {
                 _ = tokio::time::sleep(left) => break StopReason::Partial,
                 completion = self.provider.stream(&self.messages, &self.tools, &mut on_delta) => completion?,
             };
-            usage.input += completion.usage.input;
-            usage.output += completion.usage.output;
+            let llm_ms = asked.elapsed().as_millis() as u64;
+            let ttft_ms = completion.ttft_ms;
+            let reason = completion.stop;
             context = completion.usage.input;
 
-            if completion.tool_calls.is_empty() {
-                // Text is the answer only when the model asked for nothing else.
-                // Narration alongside a tool call is not an answer, however it reads.
+            // Text is the answer only when the model asked for nothing else. Narration
+            // alongside a tool call is not an answer, however it reads.
+            let answered = completion.tool_calls.is_empty();
+            if answered {
                 answer = completion.text.clone();
                 self.messages
                     .push(Message::text(Role::Assistant, completion.text));
-                break completion.stop;
+            } else {
+                self.messages.push(Message::calls(
+                    completion.text,
+                    completion.tool_calls.clone(),
+                ));
+                for call in &completion.tool_calls {
+                    let result = self.execute(call, on_event).await?;
+                    self.messages
+                        .push(Message::tool_result(call.id.clone(), result));
+                }
             }
 
-            self.messages.push(Message::calls(
-                completion.text,
-                completion.tool_calls.clone(),
-            ));
-            for call in &completion.tool_calls {
-                let result = self.execute(call, on_event).await?;
-                self.messages
-                    .push(Message::tool_result(call.id.clone(), result));
+            // Drained after the tools have run, because a tool that talks to a model spends
+            // on this step and the agent never sees those calls to bill them itself.
+            let mut spent = completion.usage;
+            let (batched_in, batched_out) = self.host.drain_tokens();
+            spent.input += batched_in;
+            spent.output += batched_out;
+            usage.input += spent.input;
+            usage.output += spent.output;
+            if let Some(cached) = spent.cached {
+                *usage.cached.get_or_insert(0) += cached;
+            }
+            on_event(Event::StepEnd {
+                turn_id,
+                agent: self.id,
+                step: steps,
+                llm_ms,
+                ttft_ms,
+                usage: spent,
+            });
+
+            if answered {
+                break reason;
             }
         };
 
@@ -538,8 +610,30 @@ impl Agent {
             stop,
             usage,
             context,
+            wall_ms: started.elapsed().as_millis() as u64,
+            shape: self.shape(context),
         });
         Ok(Outcome { text: answer, stop })
+    }
+
+    /// Splits `context` — the provider's exact prompt total — across the three things that
+    /// fill it, by serialized size. There is no tokenizer here and adding one to sharpen a
+    /// gauge would be a poor trade: prose and JSON tokenize differently enough that each
+    /// bucket is worth about ±10%, which is the precision the question deserves.
+    fn shape(&self, context: u32) -> ContextShape {
+        let system = self.messages.first().map_or(0, size);
+        let tools = serde_json::to_vec(&self.tools).map_or(0, |bytes| bytes.len());
+        let said: usize = self.messages.iter().skip(1).map(size).sum();
+        let total = system + tools + said;
+        if total == 0 || context == 0 {
+            return ContextShape::default();
+        }
+        let share = |part: usize| ((part as u64 * context as u64) / total as u64) as u32;
+        ContextShape {
+            system: share(system),
+            tools: share(tools),
+            messages: share(said),
+        }
     }
 
     async fn execute(

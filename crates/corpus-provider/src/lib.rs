@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, Serializer};
@@ -116,6 +116,12 @@ pub enum StopReason {
 pub struct Usage {
     pub input: u32,
     pub output: u32,
+    /// Prompt tokens the provider served from its own cache. `None` is a provider that
+    /// never said, which is not the same as a cache that missed: rendering it as zero
+    /// would assert a cold cache nobody measured. Every gateway spells it differently and
+    /// the reference one spells it not at all.
+    #[serde(default)]
+    pub cached: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -240,6 +246,10 @@ pub struct Completion {
     pub tool_calls: Vec<ToolCall>,
     pub stop: StopReason,
     pub usage: Usage,
+    /// Request sent to the first delta a reader would have seen, on the attempt that
+    /// answered. Retries are the caller's to account for: it is the one that knows it
+    /// waited. `None` when the stream ended without ever saying anything.
+    pub ttft_ms: Option<u64>,
 }
 
 /// The names an OpenAI-compatible listing gives the context window. Every gateway spells
@@ -433,6 +443,7 @@ impl Provider {
                 "tools": tools,
             }}));
         }
+        let sent = Instant::now();
         let mut response = self
             .http
             .post(&url)
@@ -480,7 +491,7 @@ impl Provider {
                 traced(read, &line);
                 if acc.feed(&line, on_delta) {
                     acc.flush(on_delta);
-                    return Ok(acc.finish());
+                    return Ok(acc.finish(sent));
                 }
                 line.clear();
             }
@@ -490,7 +501,7 @@ impl Provider {
         traced(read, &line);
         acc.feed(&line, on_delta);
         acc.flush(on_delta);
-        Ok(acc.finish())
+        Ok(acc.finish(sent))
     }
 }
 
@@ -659,6 +670,30 @@ struct Acc {
     calls: BTreeMap<u64, PartialCall>,
     stop: Option<StopReason>,
     usage: Usage,
+    /// When the model first said something. Latched once and never moved.
+    first_token: Option<Instant>,
+}
+
+/// Whether a delta moved the answer forward. The opening frame of a stream is
+/// `content:""` and gateways send heartbeats that carry nothing, so a measure taken at the
+/// first delta of any kind flatters itself by a chunk. What counts is the first delta a
+/// reader would have seen.
+fn carries_token(delta: &Value) -> bool {
+    let said = |key: &str| delta[key].as_str().is_some_and(|text| !text.is_empty());
+    said("content")
+        || said("reasoning")
+        || said("reasoning_content")
+        || delta["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| calls.iter().any(names_or_writes))
+}
+
+fn names_or_writes(call: &Value) -> bool {
+    call["function"]["name"].is_string()
+        || call["name"].is_string()
+        || call["function"]["arguments"]
+            .as_str()
+            .is_some_and(|args| !args.is_empty())
 }
 
 impl Acc {
@@ -681,8 +716,18 @@ impl Acc {
         if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
             self.usage.input = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
             self.usage.output = usage["completion_tokens"].as_u64().unwrap_or(0) as u32;
+            // Three spellings for one number, in the order the gateways we speak to use
+            // them. Absent everywhere leaves it None.
+            self.usage.cached = usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .or_else(|| usage["prompt_cache_hit_tokens"].as_u64())
+                .or_else(|| usage["cache_read_input_tokens"].as_u64())
+                .map(|cached| cached as u32);
         }
         for choice in chunk["choices"].as_array().into_iter().flatten() {
+            if self.first_token.is_none() && carries_token(&choice["delta"]) {
+                self.first_token = Some(Instant::now());
+            }
             if let Some(reason) = choice["finish_reason"].as_str() {
                 self.stop = Some(match reason {
                     "tool_calls" | "function_call" => StopReason::ToolCalls,
@@ -794,7 +839,7 @@ impl Acc {
     }
 
     /// Always after `flush`, which is what places whatever was held back.
-    fn finish(mut self) -> Completion {
+    fn finish(mut self, sent: Instant) -> Completion {
         self.text.push_str(&self.clean_text.flush());
         // A terminator that arrived after the hold gave up still marks where thinking ended.
         let text = std::mem::take(&mut self.text);
@@ -824,6 +869,9 @@ impl Acc {
             tool_calls,
             stop,
             usage: self.usage,
+            ttft_ms: self
+                .first_token
+                .map(|at| at.duration_since(sent).as_millis() as u64),
         }
     }
 }
@@ -831,6 +879,37 @@ impl Acc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clock cannot settle this one: in a test every frame of a stream arrives on the
+    /// same read, so which frame was picked is only visible in the predicate itself.
+    #[test]
+    fn only_a_delta_a_reader_would_have_seen_starts_the_clock() {
+        let silent = [
+            json!({}),
+            json!({ "content": "" }),
+            json!({ "role": "assistant", "content": "" }),
+            json!({ "reasoning": "" }),
+            json!({ "tool_calls": [] }),
+            json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "" } }] }),
+        ];
+        for delta in silent {
+            assert!(!carries_token(&delta), "{delta} says nothing a reader sees");
+        }
+
+        let spoke = [
+            json!({ "content": "h" }),
+            json!({ "reasoning": "h" }),
+            json!({ "reasoning_content": "h" }),
+            json!({ "tool_calls": [{ "index": 0, "function": { "name": "python" } }] }),
+            json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "{" } }] }),
+        ];
+        for delta in spoke {
+            assert!(
+                carries_token(&delta),
+                "{delta} is the model saying something"
+            );
+        }
+    }
 
     #[test]
     fn a_gateways_own_name_for_a_model_finds_the_weights_it_serves() {

@@ -6,7 +6,7 @@ use corpus_agent::{Agent, Budget, Event, Outcome};
 use corpus_kernel::{Host, Kernel};
 use corpus_provider::{Provider, StopReason};
 use corpus_testkit::{
-    Endpoint, delta, finish, kernel_dir, python_call, runs_python, says, serve, sse,
+    Endpoint, content, delta, finish, kernel_dir, python_call, runs_python, says, serve, sse,
 };
 use serde_json::{Value, json};
 
@@ -439,5 +439,96 @@ async fn a_model_that_stops_answering_does_not_hold_the_turn_forever() {
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "the clock has to run during the request, not only between them"
+    );
+}
+
+/// A step that answers in text calls no tools and so leaves no other mark on the log.
+/// Without a boundary of its own, a two-step turn and a one-step turn read identically.
+#[tokio::test]
+async fn every_step_is_numbered_and_carries_its_own_spend() {
+    fn billed(input: u32, output: u32) -> String {
+        format!(
+            r#"{{"choices":[],"usage":{{"prompt_tokens":{input},"completion_tokens":{output}}}}}"#
+        )
+    }
+
+    let calls = format!(
+        r#""tool_calls":[{}]"#,
+        python_call("call_1", "print('one')")
+    );
+    let endpoint = serve(vec![
+        sse(&[&delta(&calls), &finish("tool_calls"), &billed(100, 20)]),
+        sse(&[&content("done"), &finish("stop"), &billed(150, 5)]),
+    ])
+    .await;
+    let host = Arc::new(Recorder::default());
+    let mut agent = agent(&endpoint, host, Budget::default()).await;
+    let (_, events) = ask(&mut agent, "go").await;
+
+    let steps: Vec<(u32, u32, u32)> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::StepEnd {
+                step,
+                usage,
+                ttft_ms,
+                ..
+            } => {
+                assert!(ttft_ms.is_some(), "step {step} streamed and said nothing?");
+                Some((*step, usage.input, usage.output))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(steps, [(1, 100, 20), (2, 150, 5)]);
+
+    let turn = events
+        .iter()
+        .find_map(|event| match event {
+            Event::TurnEnd { usage, .. } => Some(*usage),
+            _ => None,
+        })
+        .expect("a turn ends");
+    assert_eq!(
+        (turn.input, turn.output),
+        (250, 25),
+        "the turn is the sum of its steps"
+    );
+}
+
+/// The provider states the prompt's total and nothing about its parts. The split is an
+/// apportionment, so what it must get right is the ordering and the total — not the digits.
+#[tokio::test]
+async fn the_context_split_shares_out_the_total_it_was_given() {
+    let endpoint = serve(vec![sse(&[
+        &content("hi"),
+        &finish("stop"),
+        r#"{"choices":[],"usage":{"prompt_tokens":9000,"completion_tokens":3}}"#,
+    ])])
+    .await;
+    let host = Arc::new(Recorder::default());
+    let mut agent = agent(&endpoint, host, Budget::default()).await;
+    let (_, events) = ask(&mut agent, "go").await;
+
+    let (context, shape) = events
+        .iter()
+        .find_map(|event| match event {
+            Event::TurnEnd { context, shape, .. } => Some((*context, *shape)),
+            _ => None,
+        })
+        .expect("a turn ends");
+
+    assert!(context > 0, "the split has nothing to share out");
+    let parts = shape.system + shape.tools + shape.messages;
+    assert!(
+        parts <= context,
+        "the parts claim {parts} of a {context}-token prompt"
+    );
+    // This agent is told about `python` and every skill in the checkout, which is far more
+    // text than a one-word prompt: a split that put the conversation first is measuring
+    // the wrong thing.
+    assert!(
+        shape.tools + shape.system >= shape.messages,
+        "shape {shape:?} makes one word of conversation the bulk of the prompt"
     );
 }

@@ -1,4 +1,6 @@
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -55,6 +57,9 @@ fn keep(news: &mut Vec<Event>, spent: &mut Usage, event: &Event) {
         Event::TurnEnd { usage, .. } => {
             spent.input += usage.input;
             spent.output += usage.output;
+            if let Some(cached) = usage.cached {
+                *spent.cached.get_or_insert(0) += cached;
+            }
         }
         _ => {}
     }
@@ -65,6 +70,9 @@ fn bill(spent: &mut Usage, event: &mut Event) {
     if let Event::TurnEnd { usage, .. } = event {
         usage.input += spent.input;
         usage.output += spent.output;
+        if let Some(cached) = spent.cached {
+            *usage.cached.get_or_insert(0) += cached;
+        }
         *spent = Usage::default();
     }
 }
@@ -113,10 +121,20 @@ pub struct Local {
     news: Vec<Event>,
     /// What the children have spent and nobody has been billed for yet.
     spent: Usage,
+    /// How much context the model has, filled in by whoever resolved it. Read at the
+    /// announcement rather than captured at construction, because a provider that has to
+    /// be asked answers after the session already exists — and zero, which is what a
+    /// provider that never says leaves here, is a reading with no denominator.
+    window: Arc<AtomicU32>,
 }
 
 impl Local {
-    pub fn new(agent: Agent, model: String, children: mpsc::UnboundedReceiver<Event>) -> Local {
+    pub fn new(
+        agent: Agent,
+        model: String,
+        children: mpsc::UnboundedReceiver<Event>,
+        window: Arc<AtomicU32>,
+    ) -> Local {
         Local {
             session_id: Uuid::now_v7(),
             model: Some(model),
@@ -125,6 +143,7 @@ impl Local {
             autonomous: 0,
             news: Vec::new(),
             spent: Usage::default(),
+            window,
         }
     }
 }
@@ -196,6 +215,7 @@ impl Local {
             on_event(Event::SessionStart {
                 session_id: self.session_id,
                 model,
+                window: self.window.load(Ordering::Relaxed),
             });
         }
         // The turn's own events go down a channel rather than into `on_event`, so that

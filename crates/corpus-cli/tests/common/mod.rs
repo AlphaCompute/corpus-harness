@@ -180,7 +180,17 @@ pub fn transcript(log: &Path) -> Vec<Value> {
     events(log)
         .into_iter()
         .map(|mut event| {
-            for key in ["session_id", "turn_id", "agent", "at"] {
+            // Ids and clocks: what a second run of the same session cannot repeat, and
+            // what no assertion about a transcript is ever about.
+            for key in [
+                "session_id",
+                "turn_id",
+                "agent",
+                "at",
+                "llm_ms",
+                "ttft_ms",
+                "wall_ms",
+            ] {
                 event.as_object_mut().unwrap().remove(key);
             }
             event

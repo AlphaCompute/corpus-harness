@@ -38,6 +38,7 @@ async fn a_local_run_draws_the_stream_and_writes_the_log() {
             "turn_start",
             "user_message",
             "message_delta",
+            "step_end",
             "answer",
             "turn_end",
             "session_end"

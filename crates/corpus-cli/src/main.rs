@@ -553,8 +553,30 @@ impl Sink {
             Event::ToolStream { text, .. } => print!("{text}"),
             Event::ToolEnd { ok, summary, .. } => println!("{} {summary}", tui::mark(*ok)),
             Event::Compaction { dropped, .. } => println!("· compacted {dropped} tool results"),
-            Event::TurnEnd { stop, usage, .. } => {
-                println!("\n· {stop:?} · {} in / {} out", usage.input, usage.output)
+            Event::StepEnd {
+                step,
+                llm_ms,
+                ttft_ms,
+                usage,
+                ..
+            } => {
+                let ttft = ttft_ms.map_or(String::new(), |ms| format!(" · ttft {ms}ms"));
+                println!(
+                    "\n· step {step} · {llm_ms}ms{ttft} · {} in / {} out",
+                    usage.input, usage.output
+                )
+            }
+            Event::TurnEnd {
+                stop,
+                usage,
+                wall_ms,
+                shape,
+                ..
+            } => {
+                println!(
+                    "\n· {stop:?} · {wall_ms}ms · {} in / {} out · ~sys {} · tools {} · msgs {}",
+                    usage.input, usage.output, shape.system, shape.tools, shape.messages
+                )
             }
             _ => {}
         }
@@ -603,6 +625,10 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         }
     }
     let model = provider.model.clone();
+    // The same number twice: the readout waits on it, and the session announces it. A
+    // session that started before the answer landed would otherwise put zero on the wire
+    // and leave every downstream reading without a denominator.
+    let announced = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (found, known) = tokio::sync::oneshot::channel();
     match window {
         // Asking for the listing is worth a percentage on screen, and never worth a
@@ -611,17 +637,20 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         0 if !asked => {
             let ask = provider.clone();
             let named = model.clone();
+            let filled = announced.clone();
             tokio::spawn(async move {
                 let listed = ask.models().await.unwrap_or_default();
                 let tokens = listed
                     .iter()
                     .find(|model| model.id == named)
                     .map_or(0, |model| model.window);
+                filled.store(tokens, std::sync::atomic::Ordering::Relaxed);
                 let _ = found.send(tokens);
             });
         }
         // Zero here is a listing that was read and stated nothing: no share on screen.
         named => {
+            announced.store(named, std::sync::atomic::Ordering::Relaxed);
             let _ = found.send(named);
         }
     }
@@ -656,7 +685,7 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         agent.replay(Jsonl::read::<Event>(path)?);
     }
     Ok((
-        LocalSession::new(agent, model.clone(), heard),
+        LocalSession::new(agent, model.clone(), heard, announced),
         Opening {
             model,
             window: known,

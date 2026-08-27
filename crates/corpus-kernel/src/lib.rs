@@ -21,6 +21,15 @@ const STDERR_TAIL: usize = 8192;
 #[async_trait]
 pub trait Host: Send + Sync {
     async fn call(&self, name: &str, args: Value) -> Result<Value, String>;
+
+    /// Input and output tokens the host spent on the agent's behalf since it was last
+    /// asked, and zeroed by the asking. A tool that talks to a model spends against the
+    /// same budget the turn does, but the agent never sees those calls, so the count has
+    /// to be collected rather than observed. A plain tuple keeps a provider's `Usage` out
+    /// of the kernel, which has no other reason to know about one.
+    fn drain_tokens(&self) -> (u32, u32) {
+        (0, 0)
+    }
 }
 
 #[derive(Debug)]
