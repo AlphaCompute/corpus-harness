@@ -522,6 +522,23 @@ async fn a_cell_reports_what_it_left_in_the_namespace() {
     assert_eq!(again.names[0].repr.as_deref(), Some("43"));
     assert_eq!(again.gone, ["chunks"]);
 
+    // One budget covers both: a cell that deletes far more names than the summary
+    // holds would otherwise send every one of them.
+    let (many, _) = run(&mut kernel, "for i in range(120): globals()[f'n{i}'] = i").await;
+    assert!(
+        many.names.len() <= 40,
+        "{} names reported",
+        many.names.len()
+    );
+    assert!(many.trimmed > 0, "what did not fit is counted, not dropped");
+    let (cleared, _) = run(&mut kernel, "for i in range(120): del globals()[f'n{i}']").await;
+    assert!(
+        cleared.names.len() + cleared.gone.len() <= 40,
+        "{} reported after a mass delete",
+        cleared.names.len() + cleared.gone.len()
+    );
+    assert!(cleared.trimmed > 0);
+
     // A value too big to be worth printing is measured instead.
     let (big, _) = run(&mut kernel, "big = 'x' * 5000").await;
     let big = big.names.iter().find(|b| b.name == "big").expect("bound");

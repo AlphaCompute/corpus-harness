@@ -726,7 +726,10 @@ impl Agent {
             result.push_str(&outcome.repr);
         }
         let result = tool_result(outcome.ok, result, &outcome.traceback);
-        if !outcome.names.is_empty() || !outcome.gone.is_empty() {
+        // `trimmed` alone still says something: a cell that bound more names than the
+        // summary holds is a cell whose namespace grew, and silence would read as one
+        // that changed nothing.
+        if !outcome.names.is_empty() || !outcome.gone.is_empty() || outcome.trimmed > 0 {
             on_event(Event::Namespace {
                 agent: self.id,
                 call_id: call.id.clone(),

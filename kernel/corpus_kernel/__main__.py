@@ -196,10 +196,15 @@ def _namespace(ns, floor, seen):
     seen.clear()
     seen.update(now)
 
-    trimmed = len(changed) - MAX_NAMES
-    if trimmed > 0:
-        changed = changed[:MAX_NAMES]
-    return changed, gone, max(0, trimmed)
+    # One budget for both: a cell that deletes two hundred tracked names would
+    # otherwise send every one of them, and a frame nobody can read is worth less
+    # than a short one that says how much it left out.
+    trimmed = max(0, len(changed) - MAX_NAMES)
+    changed = changed[:MAX_NAMES]
+    room = MAX_NAMES - len(changed)
+    trimmed += max(0, len(gone) - room)
+    gone = gone[:room]
+    return changed, gone, trimmed
 
 
 def _left(ns, floor, seen):
