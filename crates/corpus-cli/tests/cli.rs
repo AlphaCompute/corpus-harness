@@ -3,8 +3,8 @@ mod common;
 use corpus_testkit::{kernel_dir, says, serve};
 
 use common::{
-    BIN, Step, ask, command, corpus, ends_turn, field, printed, served, succeeds, transcript,
-    workdir,
+    BIN, Step, ask, command, corpus, corpus_raw, ends_turn, field, printed, served, succeeds,
+    transcript, workdir,
 };
 
 #[tokio::test]
@@ -571,4 +571,75 @@ async fn the_step_ceiling_can_be_raised_from_the_environment() {
         .find(|event| event["t"] == "turn_end")
         .unwrap();
     assert_eq!(ended["stop"], "partial");
+}
+
+/// A served turn is one turn of a conversation that outlives the process running it, so
+/// where it picks up from has to arrive on the way in. Without this the second question of
+/// a conversation is asked of a session that has never heard the first.
+#[tokio::test]
+async fn a_served_turn_carries_on_from_the_log_it_was_given() {
+    let dir = workdir("serve-resume");
+    let log = dir.join("thread.jsonl");
+    let endpoint = serve(vec![
+        says("Paris."),
+        says("It has about two million people."),
+    ])
+    .await;
+
+    // The first turn has nothing to resume from and says so by not asking; the second is a
+    // different process handed the log the first one wrote. One log per conversation,
+    // appended: read whole at startup, then added to.
+    let path = log.to_str().unwrap();
+    for (question, resume) in [("Capital of France?", false), ("How big is it?", true)] {
+        let mut args = vec!["connect", question, "--", BIN, "serve", "--log", path];
+        if resume {
+            args.extend(["--resume", path]);
+        }
+        corpus(&endpoint, &args, &[]).await;
+    }
+
+    let asked = field(&log, "user_message", "text");
+    assert_eq!(
+        asked,
+        ["Capital of France?", "How big is it?"],
+        "both turns landed in the one log"
+    );
+    // What the second turn actually sent the model is the proof: the first exchange has to
+    // be in the prompt, or the conversation did not carry.
+    let sent = endpoint.requests();
+    assert!(
+        sent[1].contains("Capital of France?") && sent[1].contains("Paris."),
+        "the second turn was asked without the first: {}",
+        &sent[1][..sent[1].len().min(600)]
+    );
+}
+
+/// A log that was named and is not there means a conversation the caller believes it is
+/// continuing would come back with no memory of itself and nothing to say it had lost one.
+#[tokio::test]
+async fn a_served_turn_refuses_a_log_it_cannot_find() {
+    let dir = workdir("serve-missing");
+    let endpoint = serve(vec![says("never asked")]).await;
+    let missing = dir.join("nothing-here.jsonl");
+
+    let (out, code) = corpus_raw(
+        &endpoint,
+        &[
+            "connect",
+            "hello",
+            "--",
+            BIN,
+            "serve",
+            "--resume",
+            missing.to_str().unwrap(),
+        ],
+        &[],
+    )
+    .await;
+    assert_ne!(
+        code,
+        Some(0),
+        "a resume that cannot happen is not a success"
+    );
+    assert!(out.contains("cannot resume"), "{out}");
 }
