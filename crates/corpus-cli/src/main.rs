@@ -603,9 +603,18 @@ impl Sink {
                 shape,
                 ..
             } => {
+                // An unmeasured shape is three zeroes, and printing them would claim a
+                // prompt made of nothing rather than a split nobody worked out.
+                let split = match shape.system + shape.tools + shape.messages {
+                    0 => String::new(),
+                    _ => format!(
+                        " · ~sys {} · tools {} · msgs {}",
+                        shape.system, shape.tools, shape.messages
+                    ),
+                };
                 println!(
-                    "\n· {stop:?} · {wall_ms}ms · {} in / {} out · ~sys {} · tools {} · msgs {}",
-                    usage.input, usage.output, shape.system, shape.tools, shape.messages
+                    "\n· {stop:?} · {wall_ms}ms · {} in / {} out{split}",
+                    usage.input, usage.output
                 )
             }
             _ => {}

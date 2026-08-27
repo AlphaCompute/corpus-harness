@@ -1389,6 +1389,43 @@ mod tests {
         );
     }
 
+    /// The cell collapses into one line when it finishes, and the summary of what it
+    /// bound must not collapse with it.
+    #[test]
+    fn what_a_cell_bound_survives_the_cell_collapsing() {
+        let agent = Uuid::now_v7();
+        let mut app = App::new();
+        app.on_event(Event::ToolStart {
+            agent,
+            call_id: "c1".into(),
+            name: "python".into(),
+            args: json!({ "code": "n = 43" }),
+        });
+        // The order the agent sends them in, and the reason it does.
+        app.on_event(Event::ToolEnd {
+            agent,
+            call_id: "c1".into(),
+            ok: true,
+            summary: "ok".into(),
+            ms: 5,
+        });
+        app.on_event(Event::Namespace {
+            agent,
+            call_id: "c1".into(),
+            names: vec![corpus_kernel::Binding {
+                name: "n".into(),
+                kind: "int".into(),
+                size: None,
+                repr: Some("43".into()),
+            }],
+            gone: vec![],
+            trimmed: 0,
+        });
+
+        let shown = screen(&mut app, 90, 12);
+        assert!(shown.contains("n 43"), "{shown}");
+    }
+
     fn press(app: &mut App, code: KeyCode) -> Action {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
     }

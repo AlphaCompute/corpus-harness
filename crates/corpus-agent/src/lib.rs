@@ -644,9 +644,15 @@ impl Agent {
     /// gauge would be a poor trade: prose and JSON tokenize differently enough that each
     /// bucket is worth about ±10%, which is the precision the question deserves.
     fn shape(&self, context: u32) -> ContextShape {
-        let system = self.messages.first().map_or(0, size);
+        // One basis for all three. `size` counts the text a message carries and nothing
+        // of the JSON around it, while a tool catalogue is mostly that JSON — measuring
+        // the two differently made the catalogue look several times its share.
+        let wire = |message: &Message| {
+            serde_json::to_vec(message).map_or_else(|_| size(message), |bytes| bytes.len())
+        };
+        let system = self.messages.first().map_or(0, wire);
         let tools = serde_json::to_vec(&self.tools).map_or(0, |bytes| bytes.len());
-        let said: usize = self.messages.iter().skip(1).map(size).sum();
+        let said: usize = self.messages.iter().skip(1).map(wire).sum();
         let total = system + tools + said;
         if total == 0 || context == 0 {
             return ContextShape::default();
@@ -726,18 +732,6 @@ impl Agent {
             result.push_str(&outcome.repr);
         }
         let result = tool_result(outcome.ok, result, &outcome.traceback);
-        // `trimmed` alone still says something: a cell that bound more names than the
-        // summary holds is a cell whose namespace grew, and silence would read as one
-        // that changed nothing.
-        if !outcome.names.is_empty() || !outcome.gone.is_empty() || outcome.trimmed > 0 {
-            on_event(Event::Namespace {
-                agent: self.id,
-                call_id: call.id.clone(),
-                names: outcome.names,
-                gone: outcome.gone,
-                trimmed: outcome.trimmed,
-            });
-        }
         on_event(Event::ToolEnd {
             agent: self.id,
             call_id: call.id.clone(),
@@ -748,6 +742,19 @@ impl Agent {
             },
             ms: started.elapsed().as_millis() as u64,
         });
+        // After the cell has ended, never before: a finished cell collapses into one
+        // line on screen, and a summary written between the two collapses with it.
+        // `trimmed` on its own still says something — a cell that bound more names than
+        // the summary holds is not a cell that changed nothing.
+        if !outcome.names.is_empty() || !outcome.gone.is_empty() || outcome.trimmed > 0 {
+            on_event(Event::Namespace {
+                agent: self.id,
+                call_id: call.id.clone(),
+                names: outcome.names,
+                gone: outcome.gone,
+                trimmed: outcome.trimmed,
+            });
+        }
         Ok(result)
     }
 
