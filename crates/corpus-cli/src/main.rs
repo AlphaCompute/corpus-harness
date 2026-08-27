@@ -553,6 +553,18 @@ impl Sink {
             Event::ToolStream { text, .. } => print!("{text}"),
             Event::ToolEnd { ok, summary, .. } => println!("{} {summary}", tui::mark(*ok)),
             Event::Compaction { dropped, .. } => println!("· compacted {dropped} tool results"),
+            Event::Namespace { names, gone, .. } => {
+                let bound: Vec<String> = names
+                    .iter()
+                    .map(|binding| match (&binding.repr, &binding.size) {
+                        (Some(shown), _) => format!("{} {shown}", binding.name),
+                        (None, Some(size)) => format!("{} {} {size}", binding.name, binding.kind),
+                        (None, None) => format!("{} {}", binding.name, binding.kind),
+                    })
+                    .chain(gone.iter().map(|name| format!("−{name}")))
+                    .collect();
+                println!("  {}", bound.join(" · "))
+            }
             Event::StepEnd {
                 step,
                 llm_ms,

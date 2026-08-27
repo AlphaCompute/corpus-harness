@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use corpus_kernel::{Host, Kernel};
+use corpus_kernel::{Binding, Host, Kernel};
 use corpus_provider::{Delta, Message, Provider, Role, StopReason, Tool, ToolCall, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -122,6 +122,22 @@ pub enum Event {
         agent: Uuid,
         dropped: usize,
     },
+    /// What a cell left in the namespace, and what it took away.
+    ///
+    /// Names and shapes only, never the values: the namespace is where a run's data lives
+    /// precisely so that it does not have to travel, and a log that carried it would undo
+    /// the one thing the design is for. What this answers is the question the log could
+    /// not — what does the model have to work with in there.
+    Namespace {
+        agent: Uuid,
+        call_id: String,
+        names: Vec<Binding>,
+        #[serde(default)]
+        gone: Vec<String>,
+        /// Names the summary would not fit, said rather than dropped in silence.
+        #[serde(default)]
+        trimmed: u32,
+    },
     /// One pass through the loop: one model call and whatever tools it asked for. A step
     /// that answers in text calls no tools and so leaves no other trace, which is why the
     /// count cannot be recovered from the rest of the log.
@@ -188,6 +204,7 @@ impl Event {
             | Event::ToolEnd { agent, .. }
             | Event::UserFile { agent, .. }
             | Event::Compaction { agent, .. }
+            | Event::Namespace { agent, .. }
             | Event::StepEnd { agent, .. }
             | Event::TurnEnd { agent, .. }
             | Event::Answer { agent, .. } => Some(*agent),
@@ -709,6 +726,15 @@ impl Agent {
             result.push_str(&outcome.repr);
         }
         let result = tool_result(outcome.ok, result, &outcome.traceback);
+        if !outcome.names.is_empty() || !outcome.gone.is_empty() {
+            on_event(Event::Namespace {
+                agent: self.id,
+                call_id: call.id.clone(),
+                names: outcome.names,
+                gone: outcome.gone,
+                trimmed: outcome.trimmed,
+            });
+        }
         on_event(Event::ToolEnd {
             agent: self.id,
             call_id: call.id.clone(),

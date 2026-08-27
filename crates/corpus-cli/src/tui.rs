@@ -749,6 +749,32 @@ impl App {
                 self.answer_at = None;
                 self.busy_with("thinking");
             }
+            Event::Namespace {
+                names,
+                gone,
+                trimmed,
+                ..
+            } => {
+                // Under the cell it belongs to, and only what changed: a run keeps its data
+                // in the namespace, so the useful line is what this cell put there.
+                let mut said: Vec<String> = names
+                    .iter()
+                    .map(|binding| match (&binding.repr, &binding.size) {
+                        (Some(shown), _) => format!("{} {shown}", binding.name),
+                        (None, Some(size)) => {
+                            format!("{} {} {size}", binding.name, binding.kind)
+                        }
+                        (None, None) => format!("{} {}", binding.name, binding.kind),
+                    })
+                    .collect();
+                said.extend(gone.iter().map(|name| format!("−{name}")));
+                if trimmed > 0 {
+                    said.push(format!("+{trimmed} more"));
+                }
+                if !said.is_empty() {
+                    self.transcript.line(2, muted(), said.join(" · "));
+                }
+            }
             Event::Compaction { dropped, .. } => {
                 self.transcript
                     .line(0, muted(), format!("· compacted {dropped} tool results"))
@@ -1319,6 +1345,47 @@ mod tests {
         assert!(
             !line.contains("Tool call"),
             "there are no tool calls here: {line}"
+        );
+    }
+
+    /// The namespace is where the data lives, so what a cell left there is the line that
+    /// says what actually happened. Values stay in the interpreter; the screen gets the
+    /// shape of them.
+    #[test]
+    fn a_cell_says_what_it_left_in_the_namespace() {
+        let agent = Uuid::now_v7();
+        let mut app = App::new();
+        app.on_event(Event::Namespace {
+            agent,
+            call_id: "c1".into(),
+            names: vec![
+                corpus_kernel::Binding {
+                    name: "n".into(),
+                    kind: "int".into(),
+                    size: None,
+                    repr: Some("43".into()),
+                },
+                corpus_kernel::Binding {
+                    name: "frame".into(),
+                    kind: "DataFrame".into(),
+                    size: Some("200000\u{d7}12".into()),
+                    repr: None,
+                },
+            ],
+            gone: vec!["chunks".into()],
+            trimmed: 3,
+        });
+
+        let shown = screen(&mut app, 90, 12);
+        assert!(shown.contains("n 43"), "{shown}");
+        assert!(shown.contains("frame DataFrame 200000\u{d7}12"), "{shown}");
+        assert!(
+            shown.contains("\u{2212}chunks"),
+            "a name that went is worth saying: {shown}"
+        );
+        assert!(
+            shown.contains("+3 more"),
+            "what did not fit is said, not dropped: {shown}"
         );
     }
 
