@@ -429,3 +429,89 @@ fn a_level_travels_as_written_when_the_route_describes_no_such_model() {
             .is_ok()
     );
 }
+
+#[test]
+fn a_thinking_level_that_is_not_a_budget_is_refused_on_that_protocol() {
+    // The Messages API's only dial for thinking is how many tokens to spend on
+    // it. A word cannot be one, and dropping it silently bills a thinking turn
+    // for an ordinary answer -- which is the contract `reasoning` states.
+    let table = r#"{"providers":{"cl":{"api":"anthropic-messages","baseURL":"http://x/v1",
+        "models":[{"id":"m","reasoningEfforts":{"high":"high"}}]}}}"#;
+    let registry = Registry::parse(table, "http://d/v1", "d").unwrap();
+    let route = registry.route("cl").unwrap();
+    let refused = format!(
+        "{:#}",
+        Provider::on(route, "m")
+            .reasoning(route, "high")
+            .err()
+            .expect("a word is not a token budget")
+    );
+    assert!(refused.contains("token budget"), "{refused}");
+}
+
+#[test]
+fn an_undescribed_model_on_that_protocol_says_so_rather_than_not_thinking() {
+    // Here the level is passed through as written, which on an OpenAI-dialect
+    // route is right and on this one cannot be turned into anything.
+    let table = r#"{"providers":{"cl":{"api":"anthropic-messages","baseURL":"http://x/v1"}}}"#;
+    let registry = Registry::parse(table, "http://d/v1", "d").unwrap();
+    let route = registry.route("cl").unwrap();
+    assert!(Provider::on(route, "unlisted").reasoning(route, "high").is_err());
+    // A budget spelled as one still works without a catalogue entry.
+    assert!(Provider::on(route, "unlisted").reasoning(route, "8000").is_ok());
+}
+
+#[tokio::test]
+async fn a_mid_stream_refusal_is_a_failure_and_not_a_short_answer() {
+    // The status was settled at 200 before a token was generated, so an overload
+    // arrives as an event. Read as content it becomes a partial answer that
+    // looks complete, and the retry loop never runs.
+    let body = sse(&[
+        r#"{"type":"message_start","message":{"id":"m","usage":{}}}"#,
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half"}}"#,
+        r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+    ]);
+    // Three, because the failure is retryable and the provider retries twice more.
+    let endpoint = serve(vec![body.clone(), body.clone(), body]).await;
+    let table = format!(
+        r#"{{"providers":{{"cl":{{"api":"anthropic-messages","baseURL":"{}"}}}}}}"#,
+        endpoint.url
+    );
+    let registry = Registry::parse(&table, "http://unused/v1", "unused").unwrap();
+    let (route, model) = registry.resolve("cl/claude-x").unwrap();
+
+    let failed = Provider::on(route, &model)
+        .stream(&[Message::text(Role::User, "hi")], &[], &mut |_| {})
+        .await
+        .expect_err("a refusal inside the stream must not read as an answer");
+    let text = format!("{failed:#}");
+    assert!(text.contains("overloaded_error"), "{text}");
+    assert_eq!(
+        endpoint.requests().len(),
+        3,
+        "an overload is transient, so it should have been retried"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_that_asking_again_cannot_fix_is_not_retried() {
+    let body = sse(&[
+        r#"{"type":"message_start","message":{"id":"m","usage":{}}}"#,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad tools"}}"#,
+    ]);
+    let endpoint = serve(vec![body]).await;
+    let table = format!(
+        r#"{{"providers":{{"cl":{{"api":"anthropic-messages","baseURL":"{}"}}}}}}"#,
+        endpoint.url
+    );
+    let registry = Registry::parse(&table, "http://unused/v1", "unused").unwrap();
+    let (route, model) = registry.resolve("cl/claude-x").unwrap();
+
+    let failed = Provider::on(route, &model)
+        .stream(&[Message::text(Role::User, "hi")], &[], &mut |_| {})
+        .await
+        .expect_err("a malformed request answers the same way every time");
+    assert!(format!("{failed:#}").contains("bad tools"));
+    assert_eq!(endpoint.requests().len(), 1, "it must not be retried");
+}

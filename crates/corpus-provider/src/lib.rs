@@ -416,10 +416,23 @@ impl Provider {
             }
         };
         match self.protocol {
-            // The only dial the Messages API has for thinking is how many tokens to
-            // spend on it, so that is what a level spells out on such a route.
+            // The only dial the Messages API has for thinking is how many tokens
+            // to spend on it, so that is what a level spells out on such a route.
+            // A spelling that is not a count is refused rather than dropped: the
+            // caller asked for a thinking turn, and silently sending an ordinary
+            // one costs the same and answers worse.
             Protocol::AnthropicMessages => {
-                self.thinking_budget = spelling.and_then(|value| value.parse().ok())
+                self.thinking_budget = match spelling {
+                    None => None,
+                    Some(value) => Some(value.parse().with_context(|| {
+                        format!(
+                            "model {:?} on route {:?} spells the reasoning level \
+                             {level:?} as {value:?}; a route speaking \
+                             anthropic-messages must spell it as a token budget",
+                            self.model, route.provider,
+                        )
+                    })?),
+                }
             }
             Protocol::OpenAiCompletions => {
                 self.reasoning_effort = spelling.map(str::to_string)
@@ -596,6 +609,9 @@ impl Provider {
                 rest = &rest[at + 1..];
                 traced(read, &line);
                 if dialect.feed(&line, &mut acc, on_delta) {
+                    if let Some(failure) = dialect.failure() {
+                        return Err(failure);
+                    }
                     acc.flush(on_delta);
                     return Ok(acc.finish(sent));
                 }
@@ -606,6 +622,9 @@ impl Provider {
         // Whatever the stream ended on without a newline of its own.
         traced(read, &line);
         dialect.feed(&line, &mut acc, on_delta);
+        if let Some(failure) = dialect.failure() {
+            return Err(failure);
+        }
         acc.flush(on_delta);
         Ok(acc.finish(sent))
     }
@@ -778,6 +797,19 @@ impl Dialect {
             Protocol::OpenAiCompletions => Dialect::OpenAi,
             Protocol::AnthropicMessages => Dialect::Anthropic(anthropic::Stream::default()),
         }
+    }
+
+    /// A refusal the provider sent inside a stream it had already answered 200
+    /// to. Left unread it becomes a partial answer that reads as a complete
+    /// short one, which no retry and no caller can tell from the real thing.
+    fn failure(&mut self) -> Option<Failure> {
+        let Dialect::Anthropic(stream) = self else {
+            return None;
+        };
+        stream.failure().map(|failed| Failure {
+            retryable: failed.retryable,
+            error: anyhow::anyhow!("{}", failed.message),
+        })
     }
 
     /// Returns true when the stream announced its end.

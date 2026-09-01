@@ -146,6 +146,15 @@ pub struct Stream {
     input_tokens: u64,
     output_tokens: u64,
     cache_read: Option<u64>,
+    failure: Option<StreamError>,
+}
+
+/// A refusal the provider sent *inside* a stream it had already answered 200 to.
+pub struct StreamError {
+    pub message: String,
+    /// Whether asking again is worth anything. Capacity and rate limits pass;
+    /// a malformed request or a rejected key answers the same way every time.
+    pub retryable: bool,
 }
 
 impl Stream {
@@ -218,9 +227,32 @@ impl Stream {
                 }
             }
             "message_stop" => return (out, true),
+            "error" => {
+                // The HTTP status was settled at 200 before a token was
+                // generated, so an overload arrives here rather than as a status
+                // code. Dropping it leaves a partial answer that reads as a
+                // complete short one, and no retry.
+                let kind = event["error"]["type"].as_str().unwrap_or_default();
+                self.failure = Some(StreamError {
+                    message: match event["error"]["message"].as_str() {
+                        Some(said) => format!("provider sent {kind}: {said}"),
+                        None => format!("provider sent {kind}"),
+                    },
+                    retryable: matches!(
+                        kind,
+                        "overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error"
+                    ),
+                });
+                return (out, true);
+            }
             _ => {}
         }
         (out, false)
+    }
+
+    /// The refusal this stream carried, if it carried one.
+    pub fn failure(&mut self) -> Option<StreamError> {
+        self.failure.take()
     }
 
     fn read_usage(&mut self, usage: &Value) {

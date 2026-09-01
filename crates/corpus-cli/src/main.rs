@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use corpus_agent::{Agent, Budget, Event};
 use corpus_kernel::Kernel;
-use corpus_provider::{Jsonl, Provider, Registry};
+use corpus_provider::{Jsonl, Protocol, Provider, Registry};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use uuid::Uuid;
 
@@ -398,6 +398,14 @@ async fn list_models() -> Result<()> {
                     config.registry.qualify(&route.provider, &model.id)
                 );
             }
+            continue;
+        }
+        // Only an OpenAI-compatible endpoint answers `GET /models` to a bearer
+        // token. The Messages API puts its listing elsewhere behind a different
+        // header, so a route speaking it is expected to spell its models out --
+        // and saying so beats printing the 401 that asking anyway would produce.
+        if route.protocol != Protocol::OpenAiCompletions {
+            println!("  (this route lists no models of its own; add them to the table)");
             continue;
         }
         match Provider::on(route, "").models().await {
