@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use corpus_agent::{Agent, Budget, Event};
 use corpus_kernel::Kernel;
-use corpus_provider::{Jsonl, Provider};
+use corpus_provider::{Jsonl, Provider, Registry};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use uuid::Uuid;
 
@@ -162,10 +162,20 @@ struct Local {
     /// (a directory to keep the logs in) says where.
     #[arg(long)]
     log: Option<PathBuf>,
+    /// Which model answers, as `model` or `provider/model`. Overrides `CORPUS_MODEL`;
+    /// `corpus models` lists what the configured routes serve.
+    #[arg(long)]
+    model: Option<String>,
+    /// How hard the model should think, named as its route spells the levels. Refused
+    /// before the first request when the chosen model does not offer it.
+    #[arg(long)]
+    reasoning: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Mode {
+    /// List what every configured route serves, under the names a request may use.
+    Models,
     /// Speak the session protocol on stdin and stdout.
     Serve {
         /// Continue the session recorded in this log. A served session is one turn of a
@@ -190,9 +200,12 @@ enum Mode {
 }
 
 struct Config {
-    base_url: String,
-    api_key: String,
     model: Option<String>,
+    /// Every provider this process can address. Without a table it holds exactly the
+    /// endpoint `CORPUS_BASE_URL` names, which is what it did before routes existed.
+    registry: Registry,
+    /// The thinking level every request carries, when one was chosen.
+    reasoning: Option<String>,
     python: Option<String>,
     kernel_dir: PathBuf,
     /// Where the wire is recorded, when something needs reporting to whoever runs the
@@ -256,11 +269,14 @@ impl Config {
             }
             None => None,
         };
+        let base_url =
+            env("CORPUS_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".into());
+        let api_key = env("CORPUS_API_KEY")
+            .or_else(|| env("OPENAI_API_KEY"))
+            .unwrap_or_default();
         Ok(Config {
-            base_url: env("CORPUS_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".into()),
-            api_key: env("CORPUS_API_KEY")
-                .or_else(|| env("OPENAI_API_KEY"))
-                .unwrap_or_default(),
+            registry: load_registry(&base_url, &api_key)?,
+            reasoning: env("CORPUS_REASONING"),
             model: env("CORPUS_MODEL"),
             python: env("CORPUS_PYTHON"),
             // ponytail: the shim is read from the source tree; packaging it into the binary
@@ -306,15 +322,94 @@ impl Config {
         }
     }
 
-    /// Every provider the process speaks through is built here: one endpoint, one key, and
-    /// the one trace file, so a batch's traffic is in the report alongside the turn's.
-    fn provider(&self, model: &str) -> Provider {
-        let provider = Provider::new(&self.base_url, &self.api_key, model);
-        match &self.trace {
+    /// Every provider the process speaks through is built here, so a batch's traffic is
+    /// in the report alongside the turn's. The name decides which route answers: one that
+    /// opens with a configured route's key goes there, and anything else goes to the
+    /// endpoint this process was started with.
+    fn provider(&self, model: &str) -> Result<Provider> {
+        let (route, id) = self.registry.resolve(model)?;
+        let mut provider = Provider::on(route, &id);
+        // Skipped for an empty name, which is the moment before a listing has said which
+        // model this is: there is nothing yet to check the level against.
+        if let Some(level) = self.reasoning.as_deref().filter(|_| !id.is_empty()) {
+            provider = provider.reasoning(route, level)?;
+        }
+        Ok(match &self.trace {
             Some(trace) => provider.tracing_to(trace.clone()),
             None => provider,
+        })
+    }
+}
+
+/// What the command line chose, as against what the environment holds. Empty for a
+/// served session, which is handed a turn rather than a choice.
+#[derive(Default)]
+struct Chosen {
+    model: Option<String>,
+    reasoning: Option<String>,
+}
+
+/// The route table, from the variable that carries it or the file that holds it.
+///
+/// This is the same document the swarm worker reads, deliberately: a provider configured
+/// once is addressable from both, under the same route names and the same model ids.
+fn load_registry(base_url: &str, api_key: &str) -> Result<Registry> {
+    let document = match (env("CORPUS_PROVIDERS"), env("CORPUS_PROVIDERS_FILE")) {
+        (Some(inline), _) => inline,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .with_context(|| format!("CORPUS_PROVIDERS_FILE names {path}, which cannot be read"))?,
+        // No table is not an error: it is every session that speaks to one endpoint,
+        // which is what this looked like before routes existed.
+        (None, None) => return Ok(Registry::single(base_url, api_key)),
+    };
+    Registry::parse(&document, base_url, api_key)
+}
+
+/// Every route and what it serves, under the names a request may use.
+///
+/// A route that spelled its models out is answered from the table, with no request; one
+/// that did not is asked, because an OpenAI-compatible endpoint's listing is the only
+/// place its catalogue exists. One unreachable route reports itself and the rest still
+/// print: a provider being down is not a reason to answer nothing.
+async fn list_models() -> Result<()> {
+    let config = Config::from_env()?;
+    for route in config.registry.routes() {
+        println!("{} ({})", route.display_name, route.provider);
+        if !route.models.is_empty() {
+            for model in &route.models {
+                let window = match model.window {
+                    0 => String::new(),
+                    tokens => format!("  {tokens} ctx"),
+                };
+                let efforts = match model.reasoning_efforts.is_empty() {
+                    true => String::new(),
+                    false => format!(
+                        "  thinking: {}",
+                        model
+                            .reasoning_efforts
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    ),
+                };
+                println!(
+                    "  {}{window}{efforts}",
+                    config.registry.qualify(&route.provider, &model.id)
+                );
+            }
+            continue;
+        }
+        match Provider::on(route, "").models().await {
+            Ok(listed) => {
+                for model in listed {
+                    println!("  {}", config.registry.qualify(&route.provider, &model.id));
+                }
+            }
+            Err(unreachable) => println!("  (could not be listed: {unreachable:#})"),
         }
     }
+    Ok(())
 }
 
 /// The interpreter that runs cells. `CORPUS_PYTHON` wins outright; otherwise the kernel
@@ -625,11 +720,20 @@ impl Sink {
 
 /// The session, and what the screen can already say about it. Nothing waits on the
 /// window: it is a readout, not a prerequisite.
-async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
-    let config = Config::from_env()?;
+async fn build_local(
+    resume: Option<&Path>,
+    chosen: Chosen,
+) -> Result<(LocalSession, Opening)> {
+    let mut config = Config::from_env()?;
+    if let Some(model) = chosen.model {
+        config.model = Some(model);
+    }
+    if let Some(level) = chosen.reasoning {
+        config.reasoning = Some(level);
+    }
     let roots = skills::roots(&config.kernel_dir);
     let python = kernel_python(&config.kernel_dir, &roots, config.python.as_deref());
-    let mut provider = config.provider(config.model.as_deref().unwrap_or_default());
+    let mut provider = config.provider(config.model.as_deref().unwrap_or_default())?;
     // Read once: the disk is not worth a second look per child.
     let offered = skills::block(&skills::discover(&roots));
 
@@ -661,6 +765,12 @@ async fn build_local(resume: Option<&Path>) -> Result<(LocalSession, Opening)> {
         provider.model = first.id;
         if window == 0 {
             window = first.window;
+        }
+        // The level could not be checked against a model nobody had named yet. Now that
+        // the listing has, the provider is rebuilt so an unserviceable level fails here
+        // rather than on the first request of the session.
+        if config.reasoning.is_some() {
+            provider = config.provider(&provider.model)?;
         }
     }
     let model = provider.model.clone();
@@ -773,7 +883,7 @@ async fn serve(resume: Option<&Path>, log: Option<&Path>) -> Result<()> {
     if let Some(path) = resume.filter(|path| !path.exists()) {
         bail!("cannot resume: {} does not exist", path.display());
     }
-    let (mut session, _) = build_local(resume).await?;
+    let (mut session, _) = build_local(resume, Chosen::default()).await?;
     let interrupt = session.interrupt();
     let mut sink = Sink::new(Render::Protocol, log)?;
 
@@ -871,8 +981,11 @@ async fn main() -> Result<()> {
                 prompt,
                 resume,
                 log,
+                model,
+                reasoning,
             } = cli.local;
-            let (session, opening) = build_local(resume.as_deref()).await?;
+            let (session, opening) =
+                build_local(resume.as_deref(), Chosen { model, reasoning }).await?;
             let path = log.or(resume).or_else(|| {
                 std::env::var_os("CORPUS_LOG")
                     .map(|dir| Path::new(&dir).join(format!("{}.jsonl", session.session_id)))
@@ -882,6 +995,7 @@ async fn main() -> Result<()> {
             }
             start(Box::new(session), prompt, path.as_deref(), opening).await
         }
+        Some(Mode::Models) => list_models().await,
         Some(Mode::Serve { resume, log }) => serve(resume.as_deref(), log.as_deref()).await,
         Some(Mode::Connect { prompt, log, argv }) => {
             let session = Remote::spawn(&argv).await?;

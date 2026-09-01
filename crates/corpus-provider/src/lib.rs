@@ -7,6 +7,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 
+pub mod anthropic;
+mod route;
+
+pub use route::{DEFAULT_MAX_TOKENS, FALLBACK, Protocol, Registry, Route, RouteModel};
+
 // Control tokens are stripped from the stream rather than sent as `stop` strings: this
 // gateway's engine mangles a streaming answer when `stop` is set, cutting the text
 // mid-word and spilling a character into the wrong field. Stopping generation at those
@@ -27,6 +32,10 @@ const HOLD: usize = 200;
 /// with nothing on the wire, and at ~100k of context that is minutes, not seconds.
 const SILENCE: Duration = Duration::from_secs(300);
 const CONNECT: Duration = Duration::from_secs(15);
+
+/// The version this crate's translation was written against. Anthropic requires the
+/// header and treats its absence as an error rather than as "the latest".
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 const ATTEMPTS: u32 = 3;
 const BACKOFF: Duration = Duration::from_millis(200);
@@ -222,6 +231,8 @@ struct Request<'a> {
     stream_options: StreamOptions,
     #[serde(skip_serializing_if = "<[Tool]>::is_empty")]
     tools: &'a [Tool],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -319,6 +330,19 @@ pub struct Provider {
     base_url: String,
     api_key: String,
     pub model: String,
+    /// Which dialect this endpoint speaks. Everything above this crate writes OpenAI
+    /// completions whatever the answer is; the translation lives in `anthropic`.
+    protocol: Protocol,
+    /// The ceiling a translated request carries. OpenAI treats an absent one as the
+    /// model's own maximum and Anthropic refuses the request outright, so a number has to
+    /// exist for a route that may be either.
+    max_tokens: u32,
+    /// Tokens the model may spend thinking, when a reasoning level was selected and this
+    /// route spells that level as a budget.
+    thinking_budget: Option<u32>,
+    /// The wire spelling of a selected reasoning level on an OpenAI-dialect route.
+    reasoning_effort: Option<String>,
+    headers: BTreeMap<String, String>,
     /// What the inference server actually sent, before anything here has read it. The
     /// session log holds this crate's interpretation of the stream — control tokens
     /// stripped, thinking split from answer, text held back and re-filed — which is the
@@ -344,8 +368,64 @@ impl Provider {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             model: model.into(),
+            protocol: Protocol::OpenAiCompletions,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            thinking_budget: None,
+            reasoning_effort: None,
+            headers: BTreeMap::new(),
             trace: None,
         }
+    }
+
+    /// A provider built against one route of the table, for one model it serves.
+    pub fn on(route: &Route, model: &str) -> Provider {
+        let mut provider = Provider::new(&route.base_url, &route.api_key, model);
+        provider.protocol = route.protocol;
+        provider.max_tokens = route.max_tokens_for(model);
+        provider.headers = route.headers.clone();
+        provider
+    }
+
+    /// Ask this model to think at the named level, in whatever spelling its route uses.
+    /// An unoffered level fails here, before the request is built: a turn that silently
+    /// did not think costs the same as one that did and answers worse.
+    pub fn reasoning(mut self, route: &Route, level: &str) -> Result<Provider> {
+        let spelling = match route.effort_wire(&self.model, level) {
+            Some(spelling) => spelling,
+            // A route that spelled out no entry for this model has said nothing about
+            // which levels it takes, so the caller's word is the only one there is and it
+            // travels as written. That is the ordinary case behind a router — the run's
+            // shim holds the catalogue, not this process — and refusing here would make
+            // the level unusable exactly where it is configured.
+            None if route.model(&self.model).is_none() => Some(level),
+            None => {
+                let offered = route
+                    .model(&self.model)
+                    .map(|entry| entry.reasoning_efforts.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                bail!(
+                    "model {:?} on route {:?} does not offer the reasoning level \
+                     {level:?}; it offers {}",
+                    self.model,
+                    route.provider,
+                    match offered.is_empty() {
+                        true => "none".to_string(),
+                        false => offered.join(", "),
+                    }
+                );
+            }
+        };
+        match self.protocol {
+            // The only dial the Messages API has for thinking is how many tokens to
+            // spend on it, so that is what a level spells out on such a route.
+            Protocol::AnthropicMessages => {
+                self.thinking_budget = spelling.and_then(|value| value.parse().ok())
+            }
+            Protocol::OpenAiCompletions => {
+                self.reasoning_effort = spelling.map(str::to_string)
+            }
+        }
+        Ok(self)
     }
 
     /// Records the wire for as long as the provider lives.
@@ -398,15 +478,26 @@ impl Provider {
         // Written straight to the bytes that get posted, borrowing the conversation rather
         // than copying it into a `Value` first. This runs once per step of every turn with
         // the whole context in it, so a spare copy of it is a spare copy per step.
-        let body = serde_json::to_vec(&Request {
-            model: &self.model,
-            messages,
-            stream: true,
-            stream_options: StreamOptions {
-                include_usage: true,
-            },
-            tools,
-        })
+        let body = match self.protocol {
+            Protocol::OpenAiCompletions => serde_json::to_vec(&Request {
+                model: &self.model,
+                messages,
+                stream: true,
+                stream_options: StreamOptions {
+                    include_usage: true,
+                },
+                tools,
+                reasoning_effort: self.reasoning_effort.as_deref(),
+            }),
+            Protocol::AnthropicMessages => serde_json::to_vec(&anthropic::request(
+                &self.model,
+                messages,
+                tools,
+                self.max_tokens,
+                self.thinking_budget,
+                true,
+            )),
+        }
         .context("serializing the request")?;
 
         for attempt in 0..ATTEMPTS {
@@ -431,7 +522,10 @@ impl Provider {
         tools: usize,
         on_delta: &mut (dyn FnMut(Delta<'_>) + Send),
     ) -> Result<Completion, Failure> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = match self.protocol {
+            Protocol::OpenAiCompletions => format!("{}/chat/completions", self.base_url),
+            Protocol::AnthropicMessages => format!("{}/messages", self.base_url),
+        };
         if let Some(trace) = &self.trace {
             // The body itself stays out: it carries the whole conversation. What a report
             // needs from this side is which model was asked, and how big the ask was.
@@ -444,11 +538,22 @@ impl Provider {
             }}));
         }
         let sent = Instant::now();
-        let mut response = self
+        let mut request = self
             .http
             .post(&url)
-            .bearer_auth(&self.api_key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        request = match self.protocol {
+            Protocol::OpenAiCompletions => request.bearer_auth(&self.api_key),
+            // Anthropic authenticates with its own header and treats a missing version as
+            // an error rather than as "the latest one".
+            Protocol::AnthropicMessages => request
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION),
+        };
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        let mut response = request
             .body(body.to_vec())
             .send()
             .await
@@ -468,6 +573,7 @@ impl Provider {
         }
 
         let mut acc = Acc::default();
+        let mut dialect = Dialect::of(self.protocol);
         let mut line = Vec::new();
         let mut read = 0;
         // Which read a line came off is what tells a buffered server from a streaming one:
@@ -489,7 +595,7 @@ impl Provider {
                 line.extend_from_slice(&rest[..at]);
                 rest = &rest[at + 1..];
                 traced(read, &line);
-                if acc.feed(&line, on_delta) {
+                if dialect.feed(&line, &mut acc, on_delta) {
                     acc.flush(on_delta);
                     return Ok(acc.finish(sent));
                 }
@@ -499,7 +605,7 @@ impl Provider {
         }
         // Whatever the stream ended on without a newline of its own.
         traced(read, &line);
-        acc.feed(&line, on_delta);
+        dialect.feed(&line, &mut acc, on_delta);
         acc.flush(on_delta);
         Ok(acc.finish(sent))
     }
@@ -659,6 +765,51 @@ struct PartialCall {
     written: Written,
 }
 
+/// Which protocol's stream is being read. The accumulator only ever sees OpenAI chunks,
+/// so this is the whole of what a second protocol costs on the reading side.
+enum Dialect {
+    OpenAi,
+    Anthropic(anthropic::Stream),
+}
+
+impl Dialect {
+    fn of(protocol: Protocol) -> Dialect {
+        match protocol {
+            Protocol::OpenAiCompletions => Dialect::OpenAi,
+            Protocol::AnthropicMessages => Dialect::Anthropic(anthropic::Stream::default()),
+        }
+    }
+
+    /// Returns true when the stream announced its end.
+    fn feed(
+        &mut self,
+        line: &[u8],
+        acc: &mut Acc,
+        on_delta: &mut dyn FnMut(Delta<'_>),
+    ) -> bool {
+        let stream = match self {
+            Dialect::OpenAi => return acc.feed(line, on_delta),
+            Dialect::Anthropic(stream) => stream,
+        };
+        let Ok(line) = std::str::from_utf8(line) else {
+            return false;
+        };
+        // `event:` lines are ignored: every Anthropic frame repeats its type inside the
+        // JSON, so the data line alone carries everything.
+        let Some(payload) = line.trim().strip_prefix("data:") else {
+            return false;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(payload.trim()) else {
+            return false;
+        };
+        let (chunks, done) = stream.feed(&event);
+        for chunk in &chunks {
+            acc.chunk(chunk, on_delta);
+        }
+        done
+    }
+}
+
 #[derive(Default)]
 struct Acc {
     text: String,
@@ -693,6 +844,13 @@ impl Acc {
         let Ok(chunk) = serde_json::from_str::<Value>(payload) else {
             return false;
         };
+        self.chunk(&chunk, on_delta);
+        false
+    }
+
+    /// One OpenAI-shaped chunk, whoever shaped it: the provider that sent it, or the
+    /// translation in [`anthropic`] for a route that speaks the other protocol.
+    fn chunk(&mut self, chunk: &Value, on_delta: &mut dyn FnMut(Delta<'_>)) {
         let mut spoke = false;
 
         if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
@@ -768,7 +926,6 @@ impl Acc {
         if spoke {
             self.first_token.get_or_insert_with(Instant::now);
         }
-        false
     }
 
     /// Everything up to a `</think>` was thinking, however it arrived; what follows the
