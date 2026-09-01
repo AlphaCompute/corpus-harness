@@ -21,12 +21,19 @@ pub struct Endpoint {
     /// Hand this to `Provider::new`.
     pub url: String,
     seen: Arc<Mutex<Vec<String>>>,
+    heads: Arc<Mutex<Vec<String>>>,
 }
 
 impl Endpoint {
     /// The request bodies the model actually received, in order.
     pub fn requests(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
+    }
+
+    /// The request line and headers of each, in the same order. What a body cannot show:
+    /// which endpoint was dialled, and which credential scheme was used to reach it.
+    pub fn heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
     }
 }
 
@@ -35,7 +42,9 @@ pub async fn serve(responses: Vec<Vec<u8>>) -> Endpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let heads = Arc::new(Mutex::new(Vec::new()));
     let recorder = seen.clone();
+    let head_recorder = heads.clone();
     tokio::spawn(async move {
         let mut responses = responses.into_iter().peekable();
         loop {
@@ -60,6 +69,7 @@ pub async fn serve(responses: Vec<Vec<u8>>) -> Endpoint {
                 return;
             };
             recorder.lock().unwrap().push(body);
+            head_recorder.lock().unwrap().push(head);
             if response.is_empty() {
                 // An empty response means: take the request and never answer it.
                 tokio::time::sleep(std::time::Duration::from_secs(120)).await;
@@ -72,6 +82,7 @@ pub async fn serve(responses: Vec<Vec<u8>>) -> Endpoint {
     Endpoint {
         url: format!("http://{addr}"),
         seen,
+        heads,
     }
 }
 
